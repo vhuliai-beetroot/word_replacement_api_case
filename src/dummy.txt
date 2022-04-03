@@ -1,0 +1,2460 @@
+Google Cloud
+Why Google
+Solutions
+Products
+Pricing
+Getting Started
+
+Docs
+Support
+
+English
+Console
+
+Cloud Architecture Center
+Contact Us
+Get started for free
+Filter
+
+Cloud Architecture Center
+Was this helpful?
+
+Send feedbackDeploying centralized VM-based appliances using internal TCP/UDP load balancer as the next hop
+This tutorial describes how to use Virtual Private Cloud (VPC) network peering to deploy a hub-and-spoke architecture.
+
+This tutorial is for cloud network engineers and operations professionals who want to implement a hub-and-spoke architecture in their Google Cloud environment using centralized appliances consisting of Compute Engine virtual machines. In this tutorial, you deploy these virtual machines as NAT gateways, but you can use the same approach for other functions such as next-generation firewalls. This tutorial assumes you are familiar with VPC networks and Compute Engine.
+
+Architecture
+In this architecture, a set of spoke VPC networks communicate with the outside through a hub VPC network in which traffic is routed through a centralized pool of appliances, in this case network address translation (NAT) gateways. The relevant routes are exported from the hub VPC network into the spoke VPC networks. The NAT gateways are configured as backends of an internal load balancer with a new default route, which has internal TCP/UDP load balancer from Cloud Load Balancing as the next hop.
+
+You can achieve the same type of load distribution and high availability by using multiple routes with equal cost multi-path (ECMP) routing. However, using the internal load balancer has the following advantages:
+
+Traffic is only forwarded to healthy instances when you rely on health checks. With ECMP, traffic is forwarded to all active instances that the route points to; using internal TCP/UDP load balancing eliminates the possibility of unused routes. Also, there is no need to clean up routes when instances are terminated or restarted.
+There is a potentially faster failover because you can fine-tune the health-check timers. If you use managed instance groups and autohealing, you can still customize the health-check timers, but they're used to recreate the instance, not route traffic.
+Google also offers Cloud NAT as a managed service, providing high availability without user management and intervention. However, Cloud NAT isn't supported in this use case because the NAT configuration isn't imported into a peered network.
+
+The following diagram shows the topology that you build in this tutorial.
+
+Architecture of a hub VPC network with two spoke VPC networks.
+
+The topology consists of a hub VPC network and two spoke VPC networks that are peered with the hub VPC network by using VPC network peering. The hub VPC network has two NAT gateway instances behind an internal TCP/UDP load balancer. A static default route (0/0 NAT-GW-ILB) points to the internal TCP/UDP load balancer as the next hop. This static default route is exported over the VPC network peering using custom routes.
+
+Objectives
+Create multiple VPC networks and peer them by using a hub-and-spoke architecture.
+Create and configure NAT gateways in the hub VPC network.
+Set up and configure the internal TCP/UDP load balancer as the next hop.
+Verify connectivity from the spoke VPC networks to the public internet.
+Costs
+This tutorial uses the following billable components of Google Cloud:
+
+Compute Engine
+To generate a cost estimate based on your projected usage, use the pricing calculator. New Google Cloud users might be eligible for a free trial.
+When you finish this tutorial, you can avoid continued billing by deleting the resources you created. For more information, see Clean up.
+
+Before you begin
+If you're new to Google Cloud, create an account to evaluate how our products perform in real-world scenarios. New customers also get $300 in free credits to run, test, and deploy workloads.
+In the Google Cloud Console, on the project selector page, select or create a Google Cloud project.
+
+Note: If you don't plan to keep the resources that you create in this procedure, create a project instead of selecting an existing project. After you finish these steps, you can delete the project, removing all resources associated with the project.
+Go to project selector
+
+Make sure that billing is enabled for your Cloud project. Learn how to check if billing is enabled on a project.
+
+Enable the Compute Engine API.
+Enable the API
+
+In the Cloud Console, activate Cloud Shell.
+
+Activate Cloud Shell
+
+At the bottom of the Cloud Console, a Cloud Shell session starts and displays a command-line prompt. Cloud Shell is a shell environment with the Google Cloud CLI already installed and with values already set for your current project. It can take a few seconds for the session to initialize.
+
+In this tutorial, you run all commands from Cloud Shell.
+Setting up your environment
+In Cloud Shell, make sure you are working in the Cloud project that you created or selected. Replace project-id with your Cloud project.
+
+gcloud config set project project-id
+
+export PROJECT_ID=`gcloud config list --format="value(core.project)"`
+Set the default compute region and zone.
+
+gcloud config set compute/region us-central1
+gcloud config set compute/zone us-central1-c
+export REGION=us-central1
+export ZONE=us-central1-c
+In this tutorial, the region is us-central1 and the zone is us-central1-c.
+
+Creating the VPC networks and subnets
+In Cloud Shell, create the hub VPC network and subnet:
+
+gcloud compute networks create hub-vpc --subnet-mode custom
+
+gcloud compute networks subnets create hub-subnet1 \
+    --network hub-vpc --range 10.0.0.0/24
+Create the spoke VPC networks, called spoke1-vpc and spoke2-vpc, with one subnet each:
+
+gcloud compute networks create spoke1-vpc --subnet-mode custom
+
+gcloud compute networks create spoke2-vpc --subnet-mode custom
+
+gcloud compute networks subnets create spoke1-subnet1 \
+    --network spoke1-vpc --range 192.168.1.0/24
+
+gcloud compute networks subnets create spoke2-subnet1 \
+    --network spoke2-vpc --range 192.168.2.0/24
+Create firewall rules in the hub VPC network and the spoke VPC networks. These rules allow internal traffic (TCP/80 and 443, UDP/53 and ICMP) from the specified RFC 1918 ranges:
+
+gcloud compute firewall-rules create hub-vpc-web-ping-dns \
+    --network hub-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.1.0/24,192.168.2.0/24
+
+gcloud compute firewall-rules create spoke1-vpc-web-ping-dns \
+    --network spoke1-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.1.0/24
+
+gcloud compute firewall-rules create spoke2-vpc-web-ping-dns \
+    --network spoke2-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.2.0/24
+Create firewall rules in the hub VPC network and the spoke VPC networks to allow IAP for SSH to access all your virtual machines:
+
+gcloud compute firewall-rules create hub-vpc-iap \
+    --network hub-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+
+gcloud compute firewall-rules create spoke1-vpc-iap \
+    --network spoke1-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+
+gcloud compute firewall-rules create spoke2-vpc-iap \
+    --network spoke2-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+This tutorial uses Identity-Aware Proxy (IAP) for SSH. For more information, see Connecting to instances that don't have external IP addresses.
+
+Create a firewall rule to allow health checks for autohealing instance groups in the hub VPC network:
+
+gcloud compute firewall-rules create hub-vpc-health-checks \
+    --network hub-vpc --allow tcp:443 --target-tags nat-gw \
+    --source-ranges 130.211.0.0/22,35.191.0.0/16
+Creating the instances and required routes
+In Cloud Shell, create the instance template for the NAT gateway that has a startup script that sets up the NAT gateway:
+
+gcloud compute instance-templates create \
+    hub-nat-gw-ilbnhop-template \
+    --network hub-vpc \
+    --subnet hub-subnet1 \
+    --machine-type n1-standard-2 --can-ip-forward \
+    --tags nat-gw --scopes default,compute-rw \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install dnsutils -y
+echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+eth0_ip="$(curl -H "Metadata-Flavor:Google" \
+    http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/ip)"
+google_dns1="$(dig +short dns.google | head -n 1)"
+google_dns2="$(dig +short dns.google | tail -n 1)"
+sudo iptables -t nat -A PREROUTING -p tcp -s 35.191.0.0/16 \
+    -d $eth0_ip --dport 443 -j DNAT --to $google_dns1
+sudo iptables -t nat -A PREROUTING -p tcp -s 130.211.0.0/22 \
+    -d $eth0_ip --dport 443 -j DNAT --to $google_dns2'
+The packets received from the source IP address ranges used for health checks and being sent to the NAT gateway's internal IP address are translated to Google's two Public DNS Anycast IP addresses (currently, 8.8.8.8 and 8.8.4.4).
+
+This tutorial is using n1-standard-2 as the instance type, but you can use any other number or size of gateway that you want. For example, n1-standard-2 instances are capped at 4 Gbps of network traffic per instance. If you need to handle a higher volume of traffic, you can choose n1-standard-8 instead.
+
+Create an HTTPS health-check:
+
+gcloud compute health-checks create https \
+    nat-gw-ilbnhop-health-check \
+    --check-interval 10 --unhealthy-threshold 3 --port 443 \
+    --host dns.google
+Create a regional instance group with two instances that are distributed across a single region:
+
+gcloud compute instance-groups managed create \
+    hub-nat-gw-ilbnhop-mig \
+    --region $REGION --size=2 \
+    --template=hub-nat-gw-ilbnhop-template \
+    --health-check nat-gw-ilbnhop-health-check \
+    --initial-delay 15
+In this tutorial, the initial delay is set to 15 seconds. In a production deployment, customize this setting according to your requirements. This tutorial isn't using autoscaling policies.
+
+Create a backend service and add the instance group:
+
+gcloud compute backend-services create hub-nat-gw-ilbnhop-backend \
+    --load-balancing-scheme=internal \
+    --protocol=tcp \
+    --health-checks=nat-gw-ilbnhop-health-check
+
+gcloud compute backend-services add-backend \
+    hub-nat-gw-ilbnhop-backend \
+    --instance-group=hub-nat-gw-ilbnhop-mig \
+    --instance-group-region=us-central1
+Create a forwarding rule:
+
+gcloud compute forwarding-rules create \
+    hub-nat-gw-ilbnhop \
+    --load-balancing-scheme=internal \
+    --network=hub-vpc \
+    --subnet=hub-subnet1 \
+    --address=10.0.0.10 \
+    --ip-protocol=TCP \
+    --ports=all \
+    --backend-service=hub-nat-gw-ilbnhop-backend \
+    --backend-service-region=us-central1 \
+    --service-label=hub-nat-gw-ilbnhop
+Even though the forwarding rule is defined only with TCP, when you use the internal TCP/UDP load balancer as the next hop, both TCP and UDP are supported behind the same virtual IP address. The internal TCP/UDP load Balancer is a regional load balancer.
+
+Create a new route with the forwarding rule as the next hop:
+
+gcloud compute routes create hub-nat-gw-ilbnhop \
+    --network=hub-vpc \
+    --destination-range=0.0.0.0/0 \
+    --next-hop-ilb=hub-nat-gw-ilbnhop \
+    --next-hop-ilb-region=us-central1 \
+    --priority=800
+The load balancer as the next hop cannot be tagged.
+
+Delete the default route from the hub VPC:
+
+export hub_default_route=$(gcloud compute routes list \
+    --format="value(name)" --filter="network:hub-vpc AND \
+    nextHopGateway:default-internet-gateway" | head -n 1)
+gcloud compute routes delete $hub_default_route -q
+Create a new tagged route to allow traffic only from the NAT gateways:
+
+gcloud compute routes create hub-default-tagged \
+    --network hub-vpc --destination-range 0.0.0.0/0 \
+    --next-hop-gateway default-internet-gateway \
+    --priority 700 --tags nat-gw
+Delete the default routes to the internet from VPC of each spoke:
+
+export spoke1_default_route=$(gcloud compute routes list \
+    --format="value(name)" --filter="network:spoke1-vpc AND \
+    nextHopGateway:default-internet-gateway")
+
+gcloud compute routes delete $spoke1_default_route -q
+
+export spoke2_default_route=$(gcloud compute routes list \
+    --format="value(name)" \
+    --filter="network:spoke2-vpc AND nextHopGateway:default-internet-gateway")
+
+gcloud compute routes delete $spoke2_default_route -q
+When there is a conflict between local and imported routes, the local ones always take precedence. For more information, see Routing order.
+
+To be able to later test connectivity by running traffic through the NAT gateway, create client VMs with hping3 installed through a startup script:
+
+gcloud compute instances create spoke1-client \
+    --subnet=spoke1-subnet1 --no-address \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install hping3 dnsutils -y'
+
+gcloud compute instances create spoke2-client \
+    --subnet=spoke2-subnet1 --no-address \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install hping3 dnsutils -y'
+Creating the VPC network peering connections
+VPC network peering is bidirectional, and thus it must be defined on both ends. A VPC network can peer with multiple VPC networks, but limits apply. To reach the default route over VPC network peering, you use the feature importing and exporting custom routes over VPC network peering.
+
+For this tutorial, you create all of the VPC networks in the same Cloud project.
+
+In Cloud Shell, create the VPC network peering connections from the hub VPC network to the spoke VPC networks with the route export flag enabled:
+
+gcloud compute networks peerings create hub-to-spoke1 \
+    --network hub-vpc --peer-network spoke1-vpc \
+    --peer-project $PROJECT_ID \
+    --export-custom-routes
+
+gcloud compute networks peerings create hub-to-spoke2 \
+    --network hub-vpc --peer-network spoke2-vpc \
+    --peer-project $PROJECT_ID \
+    --export-custom-routes
+Create a VPC network peering connection from the spoke1 VPC network to the hub VPC network with the route import flag enabled:
+
+gcloud compute networks peerings create spoke1-to-hub \
+    --network spoke1-vpc --peer-network hub-vpc \
+    --peer-project $PROJECT_ID \
+    --import-custom-routes
+Create a VPC network peering connection from the spoke2 VPC network to the hub VPC network with the route import flag enabled:
+
+gcloud compute networks peerings create spoke2-to-hub \
+    --network spoke2-vpc --peer-network hub-vpc \
+    --peer-project $PROJECT_ID \
+    --import-custom-routes
+Verifying route propagation and connectivity
+In Cloud Shell, verify that the static routes were correctly created as part of the startup scripts.
+
+gcloud compute routes list --filter="network:hub-vpc"
+Make sure that the hub-default-tagged and hub-nat-gw-ilbanhop routes are present in the output:
+
+NAME                            NETWORK  DEST_RANGE      NEXT_HOP                  PRIORITY
+default-route-13a4b635b5eab48c  hub-vpc  10.0.0.0/24     hub-vpc                   1000
+hub-default-tagged              hub-vpc  0.0.0.0/0       default-internet-gateway  700
+hub-nat-gw-ilbanhop             hub-vpc  0.0.0.0/0       10.0.0.10                 800
+peering-route-3274f1257a9842a0  hub-vpc  192.168.2.0/24  hub-to-spoke2             1000
+peering-route-798c5777f13094bc  hub-vpc  192.168.1.0/24  hub-to-spoke1             1000
+Verify the spoke1-vpc routing table to make sure the default route was correctly imported:
+
+gcloud compute routes list --filter="network:spoke1-vpc"
+Make sure that there is a route starting with peering-route with 0.0.0.0/0 as the DEST_RANGE value in the output:
+
+NAME                            NETWORK     DEST_RANGE      NEXT_HOP       PRIORITY
+default-route-75f6ea8f5fc54813  spoke1-vpc  192.168.1.0/24  spoke1-vpc     1000
+peering-route-6c7f130b860bfd39  spoke1-vpc  10.0.0.0/24     spoke1-to-hub  1000
+peering-route-9d44d362f98afbd8  spoke1-vpc  0.0.0.0/0       spoke1-to-hub  800
+Connect to one of the clients using SSH through IAP:
+
+gcloud compute ssh spoke1-client --tunnel-through-iap
+Verify connectivity by testing the Google public DNS through the NAT gateway:
+
+sudo hping3 -S -p 80 -c 3 dns.google
+Because the internal load balancer supports TCP and UDP, you can't verify internet connectivity by using an ICMP-based ping, so you have to use a tool such as hping3.
+
+The output is similar to the following:
+
+HPING dns.google (eth0 8.8.4.4): S set, 40 headers + 0 data bytes
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=0 win=65535 rtt=4.6 ms
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=1 win=65535 rtt=4.4 ms
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=2 win=65535 rtt=4.3 ms
+
+--- dns.google hping statistic ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max = 4.3/4.4/4.6 ms
+Verify the public IP address you use to communicate with the internet:
+
+curl ifconfig.co
+The output displays a public IP address of one of the NAT gateway instances. If you run the command again, the output might display a different public IP address because the connections are distributed by using the configured internal load-balancing session affinity (by default, client IP, protocol, and port).
+
+VPC network peering is non-transitive, so there is no connectivity between the spoke VPC networks through VPC network peering.
+
+Considerations for a production environment
+The configuration that you create in this tutorial provides two NAT gateways in a single region, each capable of 2 Gbps. ECMP load balancing isn't perfect, though, and an individual flow isn't spread across multiple links, which is what you want when using stateful devices such as next-generation firewalls.
+
+To deploy this configuration in the production environment, consider the following points:
+
+This configuration is best for ephemeral or non-stateful outbound links. If the size of the NAT gateway pool changes, TCP connections might be rebalanced, which could result in an established connection being reset.
+The nodes aren't automatically updated, so if a default Debian installation has a security vulnerability, you need to update the image manually.
+If you have VMs in multiple regions, you need to set up NAT gateways in each region.
+The bandwidth per gateway is up to 2 Gbps per core unidirectional. During a gateway failure, traffic is distributed to the remaining gateways. Because running flows aren't reprogrammed, traffic doesn't immediately resettle when the gateway comes back online. So make sure you allow enough overhead when sizing.
+To be alerted of unexpected results, use Cloud Monitoring to monitor the managed instance groups and network traffic.
+Clean up
+The easiest way to eliminate billing is to delete the Cloud project you created for the tutorial. Alternatively, you can delete the individual resources.
+Delete the project
+Caution: Deleting a project has the following effects:
+Everything in the project is deleted. If you used an existing project for this tutorial, when you delete it, you also delete any other work you've done in the project.
+Custom project IDs are lost. When you created this project, you might have created a custom project ID that you want to use in the future. To preserve the URLs that use the project ID, such as an appspot.com URL, delete selected resources inside the project instead of deleting the whole project.
+In the Cloud Console, go to the Manage resources page.
+Go to Manage resources
+
+In the project list, select the project that you want to delete, and then click Delete.
+In the dialog, type the project ID, and then click Shut down to delete the project.
+Delete the individual resources
+If you want to keep the Cloud project, you can delete the resources that you created for this tutorial.
+
+Delete the VPC peerings:
+
+gcloud compute networks peerings delete spoke2-to-hub \
+    --network spoke2-vpc -q
+
+gcloud compute networks peerings delete spoke1-to-hub \
+    --network spoke1-vpc -q
+
+gcloud compute networks peerings delete hub-to-spoke1 \
+    --network hub-vpc -q
+
+gcloud compute networks peerings delete hub-to-spoke2 \
+    --network hub-vpc -q
+Delete the instances, templates, and routes:
+
+gcloud compute instances delete spoke1-client \
+    --zone=us-central1-c -q
+
+gcloud compute instances delete spoke2-client \
+    --zone=us-central1-c -q
+
+gcloud compute instance-groups managed delete hub-nat-gw-mig \
+    --region us-central1 -q
+
+gcloud compute health-checks delete nat-gw-health-check -q
+
+gcloud compute instance-templates delete hub-nat-gw-template -q
+
+gcloud compute routes delete hub-default-tagged -q
+Delete the firewall rules, subnets, and VPCs:
+
+gcloud compute firewall-rules delete spoke2-vpc-iap -q
+
+gcloud compute firewall-rules delete spoke2-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete spoke1-vpc-iap -q
+
+gcloud compute firewall-rules delete spoke1-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete hub-vpc-iap -q
+
+gcloud compute firewall-rules delete hub-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete hub-vpc-health-checks -q
+
+gcloud compute networks subnets delete spoke1-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks subnets delete spoke2-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks subnets delete hub-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks delete spoke1-vpc -q
+
+gcloud compute networks delete spoke2-vpc -q
+
+gcloud compute networks delete hub-vpc -q
+What's next
+Read about Best practices and reference architectures for VPC design.
+Review the VPC peering documentation and Next-hop concepts for internal TCP/UDP load balancing.
+Read about Special configurations for VM instances, including the Building high availability and high-bandwidth NAT gateways section.
+Explore reference architectures, diagrams, tutorials, and best practices about Google Cloud. Take a look at our Cloud Architecture Center.
+Was this helpful?
+
+Send feedback
+Except as otherwise noted, the content of this page is licensed under the Creative Commons Attribution 4.0 License, and code samples are licensed under the Apache 2.0 License. For details, see the Google Developers Site Policies. Java is a registered trademark of Oracle and/or its affiliates.
+
+Last updated 2022-03-31 UTC.
+
+Why Google
+Choosing Google Cloud
+Trust and security
+Open cloud
+Multicloud
+Global infrastructure
+Sustainability
+Customers and case studies
+Analyst reports
+Whitepapers
+Blog
+Products and pricing
+Google Cloud pricing
+Google Workspace pricing
+Maps Platform pricing
+See all products
+Solutions
+Infrastructure modernization
+Databases
+Application modernization
+Smart analytics
+Artificial Intelligence
+Security
+Productivity & work transformation
+Industry solutions
+DevOps solutions
+Small business solutions
+See all solutions
+Resources
+Google Cloud documentation
+Google Cloud quickstarts
+Google Cloud Marketplace
+Google Workspace Marketplace
+Learn about cloud computing
+Support
+Code samples
+Tutorials
+Training
+Certifications
+Google Developers
+Google Cloud for Startups
+System status
+Release Notes
+Engage
+Contact sales
+Find a Partner
+Become a Partner
+Events
+Podcast
+Developer Center
+Press Corner
+Google Cloud on YouTube
+Google Cloud Tech on YouTube
+Google Workspace on YouTube
+Follow on Twitter
+Join User Research
+We're hiring. Join Google Cloud!
+Google Cloud Community
+About Google
+Privacy
+Site terms
+Google Cloud terms
+Carbon neutral since 2007
+Sign up for the Google Cloud newsletter
+Subscribe
+
+English
+The new page has loaded.
+Google Cloud
+Why Google
+Solutions
+Products
+Pricing
+Getting Started
+
+Docs
+Support
+
+English
+Console
+
+Cloud Architecture Center
+Contact Us
+Get started for free
+Filter
+
+Cloud Architecture Center
+Was this helpful?
+
+Send feedbackDeploying centralized VM-based appliances using internal TCP/UDP load balancer as the next hop
+This tutorial describes how to use Virtual Private Cloud (VPC) network peering to deploy a hub-and-spoke architecture.
+
+This tutorial is for cloud network engineers and operations professionals who want to implement a hub-and-spoke architecture in their Google Cloud environment using centralized appliances consisting of Compute Engine virtual machines. In this tutorial, you deploy these virtual machines as NAT gateways, but you can use the same approach for other functions such as next-generation firewalls. This tutorial assumes you are familiar with VPC networks and Compute Engine.
+
+Architecture
+In this architecture, a set of spoke VPC networks communicate with the outside through a hub VPC network in which traffic is routed through a centralized pool of appliances, in this case network address translation (NAT) gateways. The relevant routes are exported from the hub VPC network into the spoke VPC networks. The NAT gateways are configured as backends of an internal load balancer with a new default route, which has internal TCP/UDP load balancer from Cloud Load Balancing as the next hop.
+
+You can achieve the same type of load distribution and high availability by using multiple routes with equal cost multi-path (ECMP) routing. However, using the internal load balancer has the following advantages:
+
+Traffic is only forwarded to healthy instances when you rely on health checks. With ECMP, traffic is forwarded to all active instances that the route points to; using internal TCP/UDP load balancing eliminates the possibility of unused routes. Also, there is no need to clean up routes when instances are terminated or restarted.
+There is a potentially faster failover because you can fine-tune the health-check timers. If you use managed instance groups and autohealing, you can still customize the health-check timers, but they're used to recreate the instance, not route traffic.
+Google also offers Cloud NAT as a managed service, providing high availability without user management and intervention. However, Cloud NAT isn't supported in this use case because the NAT configuration isn't imported into a peered network.
+
+The following diagram shows the topology that you build in this tutorial.
+
+Architecture of a hub VPC network with two spoke VPC networks.
+
+The topology consists of a hub VPC network and two spoke VPC networks that are peered with the hub VPC network by using VPC network peering. The hub VPC network has two NAT gateway instances behind an internal TCP/UDP load balancer. A static default route (0/0 NAT-GW-ILB) points to the internal TCP/UDP load balancer as the next hop. This static default route is exported over the VPC network peering using custom routes.
+
+Objectives
+Create multiple VPC networks and peer them by using a hub-and-spoke architecture.
+Create and configure NAT gateways in the hub VPC network.
+Set up and configure the internal TCP/UDP load balancer as the next hop.
+Verify connectivity from the spoke VPC networks to the public internet.
+Costs
+This tutorial uses the following billable components of Google Cloud:
+
+Compute Engine
+To generate a cost estimate based on your projected usage, use the pricing calculator. New Google Cloud users might be eligible for a free trial.
+When you finish this tutorial, you can avoid continued billing by deleting the resources you created. For more information, see Clean up.
+
+Before you begin
+If you're new to Google Cloud, create an account to evaluate how our products perform in real-world scenarios. New customers also get $300 in free credits to run, test, and deploy workloads.
+In the Google Cloud Console, on the project selector page, select or create a Google Cloud project.
+
+Note: If you don't plan to keep the resources that you create in this procedure, create a project instead of selecting an existing project. After you finish these steps, you can delete the project, removing all resources associated with the project.
+Go to project selector
+
+Make sure that billing is enabled for your Cloud project. Learn how to check if billing is enabled on a project.
+
+Enable the Compute Engine API.
+Enable the API
+
+In the Cloud Console, activate Cloud Shell.
+
+Activate Cloud Shell
+
+At the bottom of the Cloud Console, a Cloud Shell session starts and displays a command-line prompt. Cloud Shell is a shell environment with the Google Cloud CLI already installed and with values already set for your current project. It can take a few seconds for the session to initialize.
+
+In this tutorial, you run all commands from Cloud Shell.
+Setting up your environment
+In Cloud Shell, make sure you are working in the Cloud project that you created or selected. Replace project-id with your Cloud project.
+
+gcloud config set project project-id
+
+export PROJECT_ID=`gcloud config list --format="value(core.project)"`
+Set the default compute region and zone.
+
+gcloud config set compute/region us-central1
+gcloud config set compute/zone us-central1-c
+export REGION=us-central1
+export ZONE=us-central1-c
+In this tutorial, the region is us-central1 and the zone is us-central1-c.
+
+Creating the VPC networks and subnets
+In Cloud Shell, create the hub VPC network and subnet:
+
+gcloud compute networks create hub-vpc --subnet-mode custom
+
+gcloud compute networks subnets create hub-subnet1 \
+    --network hub-vpc --range 10.0.0.0/24
+Create the spoke VPC networks, called spoke1-vpc and spoke2-vpc, with one subnet each:
+
+gcloud compute networks create spoke1-vpc --subnet-mode custom
+
+gcloud compute networks create spoke2-vpc --subnet-mode custom
+
+gcloud compute networks subnets create spoke1-subnet1 \
+    --network spoke1-vpc --range 192.168.1.0/24
+
+gcloud compute networks subnets create spoke2-subnet1 \
+    --network spoke2-vpc --range 192.168.2.0/24
+Create firewall rules in the hub VPC network and the spoke VPC networks. These rules allow internal traffic (TCP/80 and 443, UDP/53 and ICMP) from the specified RFC 1918 ranges:
+
+gcloud compute firewall-rules create hub-vpc-web-ping-dns \
+    --network hub-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.1.0/24,192.168.2.0/24
+
+gcloud compute firewall-rules create spoke1-vpc-web-ping-dns \
+    --network spoke1-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.1.0/24
+
+gcloud compute firewall-rules create spoke2-vpc-web-ping-dns \
+    --network spoke2-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.2.0/24
+Create firewall rules in the hub VPC network and the spoke VPC networks to allow IAP for SSH to access all your virtual machines:
+
+gcloud compute firewall-rules create hub-vpc-iap \
+    --network hub-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+
+gcloud compute firewall-rules create spoke1-vpc-iap \
+    --network spoke1-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+
+gcloud compute firewall-rules create spoke2-vpc-iap \
+    --network spoke2-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+This tutorial uses Identity-Aware Proxy (IAP) for SSH. For more information, see Connecting to instances that don't have external IP addresses.
+
+Create a firewall rule to allow health checks for autohealing instance groups in the hub VPC network:
+
+gcloud compute firewall-rules create hub-vpc-health-checks \
+    --network hub-vpc --allow tcp:443 --target-tags nat-gw \
+    --source-ranges 130.211.0.0/22,35.191.0.0/16
+Creating the instances and required routes
+In Cloud Shell, create the instance template for the NAT gateway that has a startup script that sets up the NAT gateway:
+
+gcloud compute instance-templates create \
+    hub-nat-gw-ilbnhop-template \
+    --network hub-vpc \
+    --subnet hub-subnet1 \
+    --machine-type n1-standard-2 --can-ip-forward \
+    --tags nat-gw --scopes default,compute-rw \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install dnsutils -y
+echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+eth0_ip="$(curl -H "Metadata-Flavor:Google" \
+    http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/ip)"
+google_dns1="$(dig +short dns.google | head -n 1)"
+google_dns2="$(dig +short dns.google | tail -n 1)"
+sudo iptables -t nat -A PREROUTING -p tcp -s 35.191.0.0/16 \
+    -d $eth0_ip --dport 443 -j DNAT --to $google_dns1
+sudo iptables -t nat -A PREROUTING -p tcp -s 130.211.0.0/22 \
+    -d $eth0_ip --dport 443 -j DNAT --to $google_dns2'
+The packets received from the source IP address ranges used for health checks and being sent to the NAT gateway's internal IP address are translated to Google's two Public DNS Anycast IP addresses (currently, 8.8.8.8 and 8.8.4.4).
+
+This tutorial is using n1-standard-2 as the instance type, but you can use any other number or size of gateway that you want. For example, n1-standard-2 instances are capped at 4 Gbps of network traffic per instance. If you need to handle a higher volume of traffic, you can choose n1-standard-8 instead.
+
+Create an HTTPS health-check:
+
+gcloud compute health-checks create https \
+    nat-gw-ilbnhop-health-check \
+    --check-interval 10 --unhealthy-threshold 3 --port 443 \
+    --host dns.google
+Create a regional instance group with two instances that are distributed across a single region:
+
+gcloud compute instance-groups managed create \
+    hub-nat-gw-ilbnhop-mig \
+    --region $REGION --size=2 \
+    --template=hub-nat-gw-ilbnhop-template \
+    --health-check nat-gw-ilbnhop-health-check \
+    --initial-delay 15
+In this tutorial, the initial delay is set to 15 seconds. In a production deployment, customize this setting according to your requirements. This tutorial isn't using autoscaling policies.
+
+Create a backend service and add the instance group:
+
+gcloud compute backend-services create hub-nat-gw-ilbnhop-backend \
+    --load-balancing-scheme=internal \
+    --protocol=tcp \
+    --health-checks=nat-gw-ilbnhop-health-check
+
+gcloud compute backend-services add-backend \
+    hub-nat-gw-ilbnhop-backend \
+    --instance-group=hub-nat-gw-ilbnhop-mig \
+    --instance-group-region=us-central1
+Create a forwarding rule:
+
+gcloud compute forwarding-rules create \
+    hub-nat-gw-ilbnhop \
+    --load-balancing-scheme=internal \
+    --network=hub-vpc \
+    --subnet=hub-subnet1 \
+    --address=10.0.0.10 \
+    --ip-protocol=TCP \
+    --ports=all \
+    --backend-service=hub-nat-gw-ilbnhop-backend \
+    --backend-service-region=us-central1 \
+    --service-label=hub-nat-gw-ilbnhop
+Even though the forwarding rule is defined only with TCP, when you use the internal TCP/UDP load balancer as the next hop, both TCP and UDP are supported behind the same virtual IP address. The internal TCP/UDP load Balancer is a regional load balancer.
+
+Create a new route with the forwarding rule as the next hop:
+
+gcloud compute routes create hub-nat-gw-ilbnhop \
+    --network=hub-vpc \
+    --destination-range=0.0.0.0/0 \
+    --next-hop-ilb=hub-nat-gw-ilbnhop \
+    --next-hop-ilb-region=us-central1 \
+    --priority=800
+The load balancer as the next hop cannot be tagged.
+
+Delete the default route from the hub VPC:
+
+export hub_default_route=$(gcloud compute routes list \
+    --format="value(name)" --filter="network:hub-vpc AND \
+    nextHopGateway:default-internet-gateway" | head -n 1)
+gcloud compute routes delete $hub_default_route -q
+Create a new tagged route to allow traffic only from the NAT gateways:
+
+gcloud compute routes create hub-default-tagged \
+    --network hub-vpc --destination-range 0.0.0.0/0 \
+    --next-hop-gateway default-internet-gateway \
+    --priority 700 --tags nat-gw
+Delete the default routes to the internet from VPC of each spoke:
+
+export spoke1_default_route=$(gcloud compute routes list \
+    --format="value(name)" --filter="network:spoke1-vpc AND \
+    nextHopGateway:default-internet-gateway")
+
+gcloud compute routes delete $spoke1_default_route -q
+
+export spoke2_default_route=$(gcloud compute routes list \
+    --format="value(name)" \
+    --filter="network:spoke2-vpc AND nextHopGateway:default-internet-gateway")
+
+gcloud compute routes delete $spoke2_default_route -q
+When there is a conflict between local and imported routes, the local ones always take precedence. For more information, see Routing order.
+
+To be able to later test connectivity by running traffic through the NAT gateway, create client VMs with hping3 installed through a startup script:
+
+gcloud compute instances create spoke1-client \
+    --subnet=spoke1-subnet1 --no-address \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install hping3 dnsutils -y'
+
+gcloud compute instances create spoke2-client \
+    --subnet=spoke2-subnet1 --no-address \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install hping3 dnsutils -y'
+Creating the VPC network peering connections
+VPC network peering is bidirectional, and thus it must be defined on both ends. A VPC network can peer with multiple VPC networks, but limits apply. To reach the default route over VPC network peering, you use the feature importing and exporting custom routes over VPC network peering.
+
+For this tutorial, you create all of the VPC networks in the same Cloud project.
+
+In Cloud Shell, create the VPC network peering connections from the hub VPC network to the spoke VPC networks with the route export flag enabled:
+
+gcloud compute networks peerings create hub-to-spoke1 \
+    --network hub-vpc --peer-network spoke1-vpc \
+    --peer-project $PROJECT_ID \
+    --export-custom-routes
+
+gcloud compute networks peerings create hub-to-spoke2 \
+    --network hub-vpc --peer-network spoke2-vpc \
+    --peer-project $PROJECT_ID \
+    --export-custom-routes
+Create a VPC network peering connection from the spoke1 VPC network to the hub VPC network with the route import flag enabled:
+
+gcloud compute networks peerings create spoke1-to-hub \
+    --network spoke1-vpc --peer-network hub-vpc \
+    --peer-project $PROJECT_ID \
+    --import-custom-routes
+Create a VPC network peering connection from the spoke2 VPC network to the hub VPC network with the route import flag enabled:
+
+gcloud compute networks peerings create spoke2-to-hub \
+    --network spoke2-vpc --peer-network hub-vpc \
+    --peer-project $PROJECT_ID \
+    --import-custom-routes
+Verifying route propagation and connectivity
+In Cloud Shell, verify that the static routes were correctly created as part of the startup scripts.
+
+gcloud compute routes list --filter="network:hub-vpc"
+Make sure that the hub-default-tagged and hub-nat-gw-ilbanhop routes are present in the output:
+
+NAME                            NETWORK  DEST_RANGE      NEXT_HOP                  PRIORITY
+default-route-13a4b635b5eab48c  hub-vpc  10.0.0.0/24     hub-vpc                   1000
+hub-default-tagged              hub-vpc  0.0.0.0/0       default-internet-gateway  700
+hub-nat-gw-ilbanhop             hub-vpc  0.0.0.0/0       10.0.0.10                 800
+peering-route-3274f1257a9842a0  hub-vpc  192.168.2.0/24  hub-to-spoke2             1000
+peering-route-798c5777f13094bc  hub-vpc  192.168.1.0/24  hub-to-spoke1             1000
+Verify the spoke1-vpc routing table to make sure the default route was correctly imported:
+
+gcloud compute routes list --filter="network:spoke1-vpc"
+Make sure that there is a route starting with peering-route with 0.0.0.0/0 as the DEST_RANGE value in the output:
+
+NAME                            NETWORK     DEST_RANGE      NEXT_HOP       PRIORITY
+default-route-75f6ea8f5fc54813  spoke1-vpc  192.168.1.0/24  spoke1-vpc     1000
+peering-route-6c7f130b860bfd39  spoke1-vpc  10.0.0.0/24     spoke1-to-hub  1000
+peering-route-9d44d362f98afbd8  spoke1-vpc  0.0.0.0/0       spoke1-to-hub  800
+Connect to one of the clients using SSH through IAP:
+
+gcloud compute ssh spoke1-client --tunnel-through-iap
+Verify connectivity by testing the Google public DNS through the NAT gateway:
+
+sudo hping3 -S -p 80 -c 3 dns.google
+Because the internal load balancer supports TCP and UDP, you can't verify internet connectivity by using an ICMP-based ping, so you have to use a tool such as hping3.
+
+The output is similar to the following:
+
+HPING dns.google (eth0 8.8.4.4): S set, 40 headers + 0 data bytes
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=0 win=65535 rtt=4.6 ms
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=1 win=65535 rtt=4.4 ms
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=2 win=65535 rtt=4.3 ms
+
+--- dns.google hping statistic ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max = 4.3/4.4/4.6 ms
+Verify the public IP address you use to communicate with the internet:
+
+curl ifconfig.co
+The output displays a public IP address of one of the NAT gateway instances. If you run the command again, the output might display a different public IP address because the connections are distributed by using the configured internal load-balancing session affinity (by default, client IP, protocol, and port).
+
+VPC network peering is non-transitive, so there is no connectivity between the spoke VPC networks through VPC network peering.
+
+Considerations for a production environment
+The configuration that you create in this tutorial provides two NAT gateways in a single region, each capable of 2 Gbps. ECMP load balancing isn't perfect, though, and an individual flow isn't spread across multiple links, which is what you want when using stateful devices such as next-generation firewalls.
+
+To deploy this configuration in the production environment, consider the following points:
+
+This configuration is best for ephemeral or non-stateful outbound links. If the size of the NAT gateway pool changes, TCP connections might be rebalanced, which could result in an established connection being reset.
+The nodes aren't automatically updated, so if a default Debian installation has a security vulnerability, you need to update the image manually.
+If you have VMs in multiple regions, you need to set up NAT gateways in each region.
+The bandwidth per gateway is up to 2 Gbps per core unidirectional. During a gateway failure, traffic is distributed to the remaining gateways. Because running flows aren't reprogrammed, traffic doesn't immediately resettle when the gateway comes back online. So make sure you allow enough overhead when sizing.
+To be alerted of unexpected results, use Cloud Monitoring to monitor the managed instance groups and network traffic.
+Clean up
+The easiest way to eliminate billing is to delete the Cloud project you created for the tutorial. Alternatively, you can delete the individual resources.
+Delete the project
+Caution: Deleting a project has the following effects:
+Everything in the project is deleted. If you used an existing project for this tutorial, when you delete it, you also delete any other work you've done in the project.
+Custom project IDs are lost. When you created this project, you might have created a custom project ID that you want to use in the future. To preserve the URLs that use the project ID, such as an appspot.com URL, delete selected resources inside the project instead of deleting the whole project.
+In the Cloud Console, go to the Manage resources page.
+Go to Manage resources
+
+In the project list, select the project that you want to delete, and then click Delete.
+In the dialog, type the project ID, and then click Shut down to delete the project.
+Delete the individual resources
+If you want to keep the Cloud project, you can delete the resources that you created for this tutorial.
+
+Delete the VPC peerings:
+
+gcloud compute networks peerings delete spoke2-to-hub \
+    --network spoke2-vpc -q
+
+gcloud compute networks peerings delete spoke1-to-hub \
+    --network spoke1-vpc -q
+
+gcloud compute networks peerings delete hub-to-spoke1 \
+    --network hub-vpc -q
+
+gcloud compute networks peerings delete hub-to-spoke2 \
+    --network hub-vpc -q
+Delete the instances, templates, and routes:
+
+gcloud compute instances delete spoke1-client \
+    --zone=us-central1-c -q
+
+gcloud compute instances delete spoke2-client \
+    --zone=us-central1-c -q
+
+gcloud compute instance-groups managed delete hub-nat-gw-mig \
+    --region us-central1 -q
+
+gcloud compute health-checks delete nat-gw-health-check -q
+
+gcloud compute instance-templates delete hub-nat-gw-template -q
+
+gcloud compute routes delete hub-default-tagged -q
+Delete the firewall rules, subnets, and VPCs:
+
+gcloud compute firewall-rules delete spoke2-vpc-iap -q
+
+gcloud compute firewall-rules delete spoke2-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete spoke1-vpc-iap -q
+
+gcloud compute firewall-rules delete spoke1-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete hub-vpc-iap -q
+
+gcloud compute firewall-rules delete hub-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete hub-vpc-health-checks -q
+
+gcloud compute networks subnets delete spoke1-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks subnets delete spoke2-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks subnets delete hub-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks delete spoke1-vpc -q
+
+gcloud compute networks delete spoke2-vpc -q
+
+gcloud compute networks delete hub-vpc -q
+What's next
+Read about Best practices and reference architectures for VPC design.
+Review the VPC peering documentation and Next-hop concepts for internal TCP/UDP load balancing.
+Read about Special configurations for VM instances, including the Building high availability and high-bandwidth NAT gateways section.
+Explore reference architectures, diagrams, tutorials, and best practices about Google Cloud. Take a look at our Cloud Architecture Center.
+Was this helpful?
+
+Send feedback
+Except as otherwise noted, the content of this page is licensed under the Creative Commons Attribution 4.0 License, and code samples are licensed under the Apache 2.0 License. For details, see the Google Developers Site Policies. Java is a registered trademark of Oracle and/or its affiliates.
+
+Last updated 2022-03-31 UTC.
+
+Why Google
+Choosing Google Cloud
+Trust and security
+Open cloud
+Multicloud
+Global infrastructure
+Sustainability
+Customers and case studies
+Analyst reports
+Whitepapers
+Blog
+Products and pricing
+Google Cloud pricing
+Google Workspace pricing
+Maps Platform pricing
+See all products
+Solutions
+Infrastructure modernization
+Databases
+Application modernization
+Smart analytics
+Artificial Intelligence
+Security
+Productivity & work transformation
+Industry solutions
+DevOps solutions
+Small business solutions
+See all solutions
+Resources
+Google Cloud documentation
+Google Cloud quickstarts
+Google Cloud Marketplace
+Google Workspace Marketplace
+Learn about cloud computing
+Support
+Code samples
+Tutorials
+Training
+Certifications
+Google Developers
+Google Cloud for Startups
+System status
+Release Notes
+Engage
+Contact sales
+Find a Partner
+Become a Partner
+Events
+Podcast
+Developer Center
+Press Corner
+Google Cloud on YouTube
+Google Cloud Tech on YouTube
+Google Workspace on YouTube
+Follow on Twitter
+Join User Research
+We're hiring. Join Google Cloud!
+Google Cloud Community
+About Google
+Privacy
+Site terms
+Google Cloud terms
+Carbon neutral since 2007
+Sign up for the Google Cloud newsletter
+Subscribe
+
+English
+The new page has loaded.
+Google Cloud
+Why Google
+Solutions
+Products
+Pricing
+Getting Started
+
+Docs
+Support
+
+English
+Console
+
+Cloud Architecture Center
+Contact Us
+Get started for free
+Filter
+
+Cloud Architecture Center
+Was this helpful?
+
+Send feedbackDeploying centralized VM-based appliances using internal TCP/UDP load balancer as the next hop
+This tutorial describes how to use Virtual Private Cloud (VPC) network peering to deploy a hub-and-spoke architecture.
+
+This tutorial is for cloud network engineers and operations professionals who want to implement a hub-and-spoke architecture in their Google Cloud environment using centralized appliances consisting of Compute Engine virtual machines. In this tutorial, you deploy these virtual machines as NAT gateways, but you can use the same approach for other functions such as next-generation firewalls. This tutorial assumes you are familiar with VPC networks and Compute Engine.
+
+Architecture
+In this architecture, a set of spoke VPC networks communicate with the outside through a hub VPC network in which traffic is routed through a centralized pool of appliances, in this case network address translation (NAT) gateways. The relevant routes are exported from the hub VPC network into the spoke VPC networks. The NAT gateways are configured as backends of an internal load balancer with a new default route, which has internal TCP/UDP load balancer from Cloud Load Balancing as the next hop.
+
+You can achieve the same type of load distribution and high availability by using multiple routes with equal cost multi-path (ECMP) routing. However, using the internal load balancer has the following advantages:
+
+Traffic is only forwarded to healthy instances when you rely on health checks. With ECMP, traffic is forwarded to all active instances that the route points to; using internal TCP/UDP load balancing eliminates the possibility of unused routes. Also, there is no need to clean up routes when instances are terminated or restarted.
+There is a potentially faster failover because you can fine-tune the health-check timers. If you use managed instance groups and autohealing, you can still customize the health-check timers, but they're used to recreate the instance, not route traffic.
+Google also offers Cloud NAT as a managed service, providing high availability without user management and intervention. However, Cloud NAT isn't supported in this use case because the NAT configuration isn't imported into a peered network.
+
+The following diagram shows the topology that you build in this tutorial.
+
+Architecture of a hub VPC network with two spoke VPC networks.
+
+The topology consists of a hub VPC network and two spoke VPC networks that are peered with the hub VPC network by using VPC network peering. The hub VPC network has two NAT gateway instances behind an internal TCP/UDP load balancer. A static default route (0/0 NAT-GW-ILB) points to the internal TCP/UDP load balancer as the next hop. This static default route is exported over the VPC network peering using custom routes.
+
+Objectives
+Create multiple VPC networks and peer them by using a hub-and-spoke architecture.
+Create and configure NAT gateways in the hub VPC network.
+Set up and configure the internal TCP/UDP load balancer as the next hop.
+Verify connectivity from the spoke VPC networks to the public internet.
+Costs
+This tutorial uses the following billable components of Google Cloud:
+
+Compute Engine
+To generate a cost estimate based on your projected usage, use the pricing calculator. New Google Cloud users might be eligible for a free trial.
+When you finish this tutorial, you can avoid continued billing by deleting the resources you created. For more information, see Clean up.
+
+Before you begin
+If you're new to Google Cloud, create an account to evaluate how our products perform in real-world scenarios. New customers also get $300 in free credits to run, test, and deploy workloads.
+In the Google Cloud Console, on the project selector page, select or create a Google Cloud project.
+
+Note: If you don't plan to keep the resources that you create in this procedure, create a project instead of selecting an existing project. After you finish these steps, you can delete the project, removing all resources associated with the project.
+Go to project selector
+
+Make sure that billing is enabled for your Cloud project. Learn how to check if billing is enabled on a project.
+
+Enable the Compute Engine API.
+Enable the API
+
+In the Cloud Console, activate Cloud Shell.
+
+Activate Cloud Shell
+
+At the bottom of the Cloud Console, a Cloud Shell session starts and displays a command-line prompt. Cloud Shell is a shell environment with the Google Cloud CLI already installed and with values already set for your current project. It can take a few seconds for the session to initialize.
+
+In this tutorial, you run all commands from Cloud Shell.
+Setting up your environment
+In Cloud Shell, make sure you are working in the Cloud project that you created or selected. Replace project-id with your Cloud project.
+
+gcloud config set project project-id
+
+export PROJECT_ID=`gcloud config list --format="value(core.project)"`
+Set the default compute region and zone.
+
+gcloud config set compute/region us-central1
+gcloud config set compute/zone us-central1-c
+export REGION=us-central1
+export ZONE=us-central1-c
+In this tutorial, the region is us-central1 and the zone is us-central1-c.
+
+Creating the VPC networks and subnets
+In Cloud Shell, create the hub VPC network and subnet:
+
+gcloud compute networks create hub-vpc --subnet-mode custom
+
+gcloud compute networks subnets create hub-subnet1 \
+    --network hub-vpc --range 10.0.0.0/24
+Create the spoke VPC networks, called spoke1-vpc and spoke2-vpc, with one subnet each:
+
+gcloud compute networks create spoke1-vpc --subnet-mode custom
+
+gcloud compute networks create spoke2-vpc --subnet-mode custom
+
+gcloud compute networks subnets create spoke1-subnet1 \
+    --network spoke1-vpc --range 192.168.1.0/24
+
+gcloud compute networks subnets create spoke2-subnet1 \
+    --network spoke2-vpc --range 192.168.2.0/24
+Create firewall rules in the hub VPC network and the spoke VPC networks. These rules allow internal traffic (TCP/80 and 443, UDP/53 and ICMP) from the specified RFC 1918 ranges:
+
+gcloud compute firewall-rules create hub-vpc-web-ping-dns \
+    --network hub-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.1.0/24,192.168.2.0/24
+
+gcloud compute firewall-rules create spoke1-vpc-web-ping-dns \
+    --network spoke1-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.1.0/24
+
+gcloud compute firewall-rules create spoke2-vpc-web-ping-dns \
+    --network spoke2-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.2.0/24
+Create firewall rules in the hub VPC network and the spoke VPC networks to allow IAP for SSH to access all your virtual machines:
+
+gcloud compute firewall-rules create hub-vpc-iap \
+    --network hub-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+
+gcloud compute firewall-rules create spoke1-vpc-iap \
+    --network spoke1-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+
+gcloud compute firewall-rules create spoke2-vpc-iap \
+    --network spoke2-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+This tutorial uses Identity-Aware Proxy (IAP) for SSH. For more information, see Connecting to instances that don't have external IP addresses.
+
+Create a firewall rule to allow health checks for autohealing instance groups in the hub VPC network:
+
+gcloud compute firewall-rules create hub-vpc-health-checks \
+    --network hub-vpc --allow tcp:443 --target-tags nat-gw \
+    --source-ranges 130.211.0.0/22,35.191.0.0/16
+Creating the instances and required routes
+In Cloud Shell, create the instance template for the NAT gateway that has a startup script that sets up the NAT gateway:
+
+gcloud compute instance-templates create \
+    hub-nat-gw-ilbnhop-template \
+    --network hub-vpc \
+    --subnet hub-subnet1 \
+    --machine-type n1-standard-2 --can-ip-forward \
+    --tags nat-gw --scopes default,compute-rw \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install dnsutils -y
+echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+eth0_ip="$(curl -H "Metadata-Flavor:Google" \
+    http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/ip)"
+google_dns1="$(dig +short dns.google | head -n 1)"
+google_dns2="$(dig +short dns.google | tail -n 1)"
+sudo iptables -t nat -A PREROUTING -p tcp -s 35.191.0.0/16 \
+    -d $eth0_ip --dport 443 -j DNAT --to $google_dns1
+sudo iptables -t nat -A PREROUTING -p tcp -s 130.211.0.0/22 \
+    -d $eth0_ip --dport 443 -j DNAT --to $google_dns2'
+The packets received from the source IP address ranges used for health checks and being sent to the NAT gateway's internal IP address are translated to Google's two Public DNS Anycast IP addresses (currently, 8.8.8.8 and 8.8.4.4).
+
+This tutorial is using n1-standard-2 as the instance type, but you can use any other number or size of gateway that you want. For example, n1-standard-2 instances are capped at 4 Gbps of network traffic per instance. If you need to handle a higher volume of traffic, you can choose n1-standard-8 instead.
+
+Create an HTTPS health-check:
+
+gcloud compute health-checks create https \
+    nat-gw-ilbnhop-health-check \
+    --check-interval 10 --unhealthy-threshold 3 --port 443 \
+    --host dns.google
+Create a regional instance group with two instances that are distributed across a single region:
+
+gcloud compute instance-groups managed create \
+    hub-nat-gw-ilbnhop-mig \
+    --region $REGION --size=2 \
+    --template=hub-nat-gw-ilbnhop-template \
+    --health-check nat-gw-ilbnhop-health-check \
+    --initial-delay 15
+In this tutorial, the initial delay is set to 15 seconds. In a production deployment, customize this setting according to your requirements. This tutorial isn't using autoscaling policies.
+
+Create a backend service and add the instance group:
+
+gcloud compute backend-services create hub-nat-gw-ilbnhop-backend \
+    --load-balancing-scheme=internal \
+    --protocol=tcp \
+    --health-checks=nat-gw-ilbnhop-health-check
+
+gcloud compute backend-services add-backend \
+    hub-nat-gw-ilbnhop-backend \
+    --instance-group=hub-nat-gw-ilbnhop-mig \
+    --instance-group-region=us-central1
+Create a forwarding rule:
+
+gcloud compute forwarding-rules create \
+    hub-nat-gw-ilbnhop \
+    --load-balancing-scheme=internal \
+    --network=hub-vpc \
+    --subnet=hub-subnet1 \
+    --address=10.0.0.10 \
+    --ip-protocol=TCP \
+    --ports=all \
+    --backend-service=hub-nat-gw-ilbnhop-backend \
+    --backend-service-region=us-central1 \
+    --service-label=hub-nat-gw-ilbnhop
+Even though the forwarding rule is defined only with TCP, when you use the internal TCP/UDP load balancer as the next hop, both TCP and UDP are supported behind the same virtual IP address. The internal TCP/UDP load Balancer is a regional load balancer.
+
+Create a new route with the forwarding rule as the next hop:
+
+gcloud compute routes create hub-nat-gw-ilbnhop \
+    --network=hub-vpc \
+    --destination-range=0.0.0.0/0 \
+    --next-hop-ilb=hub-nat-gw-ilbnhop \
+    --next-hop-ilb-region=us-central1 \
+    --priority=800
+The load balancer as the next hop cannot be tagged.
+
+Delete the default route from the hub VPC:
+
+export hub_default_route=$(gcloud compute routes list \
+    --format="value(name)" --filter="network:hub-vpc AND \
+    nextHopGateway:default-internet-gateway" | head -n 1)
+gcloud compute routes delete $hub_default_route -q
+Create a new tagged route to allow traffic only from the NAT gateways:
+
+gcloud compute routes create hub-default-tagged \
+    --network hub-vpc --destination-range 0.0.0.0/0 \
+    --next-hop-gateway default-internet-gateway \
+    --priority 700 --tags nat-gw
+Delete the default routes to the internet from VPC of each spoke:
+
+export spoke1_default_route=$(gcloud compute routes list \
+    --format="value(name)" --filter="network:spoke1-vpc AND \
+    nextHopGateway:default-internet-gateway")
+
+gcloud compute routes delete $spoke1_default_route -q
+
+export spoke2_default_route=$(gcloud compute routes list \
+    --format="value(name)" \
+    --filter="network:spoke2-vpc AND nextHopGateway:default-internet-gateway")
+
+gcloud compute routes delete $spoke2_default_route -q
+When there is a conflict between local and imported routes, the local ones always take precedence. For more information, see Routing order.
+
+To be able to later test connectivity by running traffic through the NAT gateway, create client VMs with hping3 installed through a startup script:
+
+gcloud compute instances create spoke1-client \
+    --subnet=spoke1-subnet1 --no-address \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install hping3 dnsutils -y'
+
+gcloud compute instances create spoke2-client \
+    --subnet=spoke2-subnet1 --no-address \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install hping3 dnsutils -y'
+Creating the VPC network peering connections
+VPC network peering is bidirectional, and thus it must be defined on both ends. A VPC network can peer with multiple VPC networks, but limits apply. To reach the default route over VPC network peering, you use the feature importing and exporting custom routes over VPC network peering.
+
+For this tutorial, you create all of the VPC networks in the same Cloud project.
+
+In Cloud Shell, create the VPC network peering connections from the hub VPC network to the spoke VPC networks with the route export flag enabled:
+
+gcloud compute networks peerings create hub-to-spoke1 \
+    --network hub-vpc --peer-network spoke1-vpc \
+    --peer-project $PROJECT_ID \
+    --export-custom-routes
+
+gcloud compute networks peerings create hub-to-spoke2 \
+    --network hub-vpc --peer-network spoke2-vpc \
+    --peer-project $PROJECT_ID \
+    --export-custom-routes
+Create a VPC network peering connection from the spoke1 VPC network to the hub VPC network with the route import flag enabled:
+
+gcloud compute networks peerings create spoke1-to-hub \
+    --network spoke1-vpc --peer-network hub-vpc \
+    --peer-project $PROJECT_ID \
+    --import-custom-routes
+Create a VPC network peering connection from the spoke2 VPC network to the hub VPC network with the route import flag enabled:
+
+gcloud compute networks peerings create spoke2-to-hub \
+    --network spoke2-vpc --peer-network hub-vpc \
+    --peer-project $PROJECT_ID \
+    --import-custom-routes
+Verifying route propagation and connectivity
+In Cloud Shell, verify that the static routes were correctly created as part of the startup scripts.
+
+gcloud compute routes list --filter="network:hub-vpc"
+Make sure that the hub-default-tagged and hub-nat-gw-ilbanhop routes are present in the output:
+
+NAME                            NETWORK  DEST_RANGE      NEXT_HOP                  PRIORITY
+default-route-13a4b635b5eab48c  hub-vpc  10.0.0.0/24     hub-vpc                   1000
+hub-default-tagged              hub-vpc  0.0.0.0/0       default-internet-gateway  700
+hub-nat-gw-ilbanhop             hub-vpc  0.0.0.0/0       10.0.0.10                 800
+peering-route-3274f1257a9842a0  hub-vpc  192.168.2.0/24  hub-to-spoke2             1000
+peering-route-798c5777f13094bc  hub-vpc  192.168.1.0/24  hub-to-spoke1             1000
+Verify the spoke1-vpc routing table to make sure the default route was correctly imported:
+
+gcloud compute routes list --filter="network:spoke1-vpc"
+Make sure that there is a route starting with peering-route with 0.0.0.0/0 as the DEST_RANGE value in the output:
+
+NAME                            NETWORK     DEST_RANGE      NEXT_HOP       PRIORITY
+default-route-75f6ea8f5fc54813  spoke1-vpc  192.168.1.0/24  spoke1-vpc     1000
+peering-route-6c7f130b860bfd39  spoke1-vpc  10.0.0.0/24     spoke1-to-hub  1000
+peering-route-9d44d362f98afbd8  spoke1-vpc  0.0.0.0/0       spoke1-to-hub  800
+Connect to one of the clients using SSH through IAP:
+
+gcloud compute ssh spoke1-client --tunnel-through-iap
+Verify connectivity by testing the Google public DNS through the NAT gateway:
+
+sudo hping3 -S -p 80 -c 3 dns.google
+Because the internal load balancer supports TCP and UDP, you can't verify internet connectivity by using an ICMP-based ping, so you have to use a tool such as hping3.
+
+The output is similar to the following:
+
+HPING dns.google (eth0 8.8.4.4): S set, 40 headers + 0 data bytes
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=0 win=65535 rtt=4.6 ms
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=1 win=65535 rtt=4.4 ms
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=2 win=65535 rtt=4.3 ms
+
+--- dns.google hping statistic ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max = 4.3/4.4/4.6 ms
+Verify the public IP address you use to communicate with the internet:
+
+curl ifconfig.co
+The output displays a public IP address of one of the NAT gateway instances. If you run the command again, the output might display a different public IP address because the connections are distributed by using the configured internal load-balancing session affinity (by default, client IP, protocol, and port).
+
+VPC network peering is non-transitive, so there is no connectivity between the spoke VPC networks through VPC network peering.
+
+Considerations for a production environment
+The configuration that you create in this tutorial provides two NAT gateways in a single region, each capable of 2 Gbps. ECMP load balancing isn't perfect, though, and an individual flow isn't spread across multiple links, which is what you want when using stateful devices such as next-generation firewalls.
+
+To deploy this configuration in the production environment, consider the following points:
+
+This configuration is best for ephemeral or non-stateful outbound links. If the size of the NAT gateway pool changes, TCP connections might be rebalanced, which could result in an established connection being reset.
+The nodes aren't automatically updated, so if a default Debian installation has a security vulnerability, you need to update the image manually.
+If you have VMs in multiple regions, you need to set up NAT gateways in each region.
+The bandwidth per gateway is up to 2 Gbps per core unidirectional. During a gateway failure, traffic is distributed to the remaining gateways. Because running flows aren't reprogrammed, traffic doesn't immediately resettle when the gateway comes back online. So make sure you allow enough overhead when sizing.
+To be alerted of unexpected results, use Cloud Monitoring to monitor the managed instance groups and network traffic.
+Clean up
+The easiest way to eliminate billing is to delete the Cloud project you created for the tutorial. Alternatively, you can delete the individual resources.
+Delete the project
+Caution: Deleting a project has the following effects:
+Everything in the project is deleted. If you used an existing project for this tutorial, when you delete it, you also delete any other work you've done in the project.
+Custom project IDs are lost. When you created this project, you might have created a custom project ID that you want to use in the future. To preserve the URLs that use the project ID, such as an appspot.com URL, delete selected resources inside the project instead of deleting the whole project.
+In the Cloud Console, go to the Manage resources page.
+Go to Manage resources
+
+In the project list, select the project that you want to delete, and then click Delete.
+In the dialog, type the project ID, and then click Shut down to delete the project.
+Delete the individual resources
+If you want to keep the Cloud project, you can delete the resources that you created for this tutorial.
+
+Delete the VPC peerings:
+
+gcloud compute networks peerings delete spoke2-to-hub \
+    --network spoke2-vpc -q
+
+gcloud compute networks peerings delete spoke1-to-hub \
+    --network spoke1-vpc -q
+
+gcloud compute networks peerings delete hub-to-spoke1 \
+    --network hub-vpc -q
+
+gcloud compute networks peerings delete hub-to-spoke2 \
+    --network hub-vpc -q
+Delete the instances, templates, and routes:
+
+gcloud compute instances delete spoke1-client \
+    --zone=us-central1-c -q
+
+gcloud compute instances delete spoke2-client \
+    --zone=us-central1-c -q
+
+gcloud compute instance-groups managed delete hub-nat-gw-mig \
+    --region us-central1 -q
+
+gcloud compute health-checks delete nat-gw-health-check -q
+
+gcloud compute instance-templates delete hub-nat-gw-template -q
+
+gcloud compute routes delete hub-default-tagged -q
+Delete the firewall rules, subnets, and VPCs:
+
+gcloud compute firewall-rules delete spoke2-vpc-iap -q
+
+gcloud compute firewall-rules delete spoke2-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete spoke1-vpc-iap -q
+
+gcloud compute firewall-rules delete spoke1-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete hub-vpc-iap -q
+
+gcloud compute firewall-rules delete hub-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete hub-vpc-health-checks -q
+
+gcloud compute networks subnets delete spoke1-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks subnets delete spoke2-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks subnets delete hub-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks delete spoke1-vpc -q
+
+gcloud compute networks delete spoke2-vpc -q
+
+gcloud compute networks delete hub-vpc -q
+What's next
+Read about Best practices and reference architectures for VPC design.
+Review the VPC peering documentation and Next-hop concepts for internal TCP/UDP load balancing.
+Read about Special configurations for VM instances, including the Building high availability and high-bandwidth NAT gateways section.
+Explore reference architectures, diagrams, tutorials, and best practices about Google Cloud. Take a look at our Cloud Architecture Center.
+Was this helpful?
+
+Send feedback
+Except as otherwise noted, the content of this page is licensed under the Creative Commons Attribution 4.0 License, and code samples are licensed under the Apache 2.0 License. For details, see the Google Developers Site Policies. Java is a registered trademark of Oracle and/or its affiliates.
+
+Last updated 2022-03-31 UTC.
+
+Why Google
+Choosing Google Cloud
+Trust and security
+Open cloud
+Multicloud
+Global infrastructure
+Sustainability
+Customers and case studies
+Analyst reports
+Whitepapers
+Blog
+Products and pricing
+Google Cloud pricing
+Google Workspace pricing
+Maps Platform pricing
+See all products
+Solutions
+Infrastructure modernization
+Databases
+Application modernization
+Smart analytics
+Artificial Intelligence
+Security
+Productivity & work transformation
+Industry solutions
+DevOps solutions
+Small business solutions
+See all solutions
+Resources
+Google Cloud documentation
+Google Cloud quickstarts
+Google Cloud Marketplace
+Google Workspace Marketplace
+Learn about cloud computing
+Support
+Code samples
+Tutorials
+Training
+Certifications
+Google Developers
+Google Cloud for Startups
+System status
+Release Notes
+Engage
+Contact sales
+Find a Partner
+Become a Partner
+Events
+Podcast
+Developer Center
+Press Corner
+Google Cloud on YouTube
+Google Cloud Tech on YouTube
+Google Workspace on YouTube
+Follow on Twitter
+Join User Research
+We're hiring. Join Google Cloud!
+Google Cloud Community
+About Google
+Privacy
+Site terms
+Google Cloud terms
+Carbon neutral since 2007
+Sign up for the Google Cloud newsletter
+Subscribe
+
+English
+The new page has loaded.
+Google Cloud
+Why Google
+Solutions
+Products
+Pricing
+Getting Started
+
+Docs
+Support
+
+English
+Console
+
+Cloud Architecture Center
+Contact Us
+Get started for free
+Filter
+
+Cloud Architecture Center
+Was this helpful?
+
+Send feedbackDeploying centralized VM-based appliances using internal TCP/UDP load balancer as the next hop
+This tutorial describes how to use Virtual Private Cloud (VPC) network peering to deploy a hub-and-spoke architecture.
+
+This tutorial is for cloud network engineers and operations professionals who want to implement a hub-and-spoke architecture in their Google Cloud environment using centralized appliances consisting of Compute Engine virtual machines. In this tutorial, you deploy these virtual machines as NAT gateways, but you can use the same approach for other functions such as next-generation firewalls. This tutorial assumes you are familiar with VPC networks and Compute Engine.
+
+Architecture
+In this architecture, a set of spoke VPC networks communicate with the outside through a hub VPC network in which traffic is routed through a centralized pool of appliances, in this case network address translation (NAT) gateways. The relevant routes are exported from the hub VPC network into the spoke VPC networks. The NAT gateways are configured as backends of an internal load balancer with a new default route, which has internal TCP/UDP load balancer from Cloud Load Balancing as the next hop.
+
+You can achieve the same type of load distribution and high availability by using multiple routes with equal cost multi-path (ECMP) routing. However, using the internal load balancer has the following advantages:
+
+Traffic is only forwarded to healthy instances when you rely on health checks. With ECMP, traffic is forwarded to all active instances that the route points to; using internal TCP/UDP load balancing eliminates the possibility of unused routes. Also, there is no need to clean up routes when instances are terminated or restarted.
+There is a potentially faster failover because you can fine-tune the health-check timers. If you use managed instance groups and autohealing, you can still customize the health-check timers, but they're used to recreate the instance, not route traffic.
+Google also offers Cloud NAT as a managed service, providing high availability without user management and intervention. However, Cloud NAT isn't supported in this use case because the NAT configuration isn't imported into a peered network.
+
+The following diagram shows the topology that you build in this tutorial.
+
+Architecture of a hub VPC network with two spoke VPC networks.
+
+The topology consists of a hub VPC network and two spoke VPC networks that are peered with the hub VPC network by using VPC network peering. The hub VPC network has two NAT gateway instances behind an internal TCP/UDP load balancer. A static default route (0/0 NAT-GW-ILB) points to the internal TCP/UDP load balancer as the next hop. This static default route is exported over the VPC network peering using custom routes.
+
+Objectives
+Create multiple VPC networks and peer them by using a hub-and-spoke architecture.
+Create and configure NAT gateways in the hub VPC network.
+Set up and configure the internal TCP/UDP load balancer as the next hop.
+Verify connectivity from the spoke VPC networks to the public internet.
+Costs
+This tutorial uses the following billable components of Google Cloud:
+
+Compute Engine
+To generate a cost estimate based on your projected usage, use the pricing calculator. New Google Cloud users might be eligible for a free trial.
+When you finish this tutorial, you can avoid continued billing by deleting the resources you created. For more information, see Clean up.
+
+Before you begin
+If you're new to Google Cloud, create an account to evaluate how our products perform in real-world scenarios. New customers also get $300 in free credits to run, test, and deploy workloads.
+In the Google Cloud Console, on the project selector page, select or create a Google Cloud project.
+
+Note: If you don't plan to keep the resources that you create in this procedure, create a project instead of selecting an existing project. After you finish these steps, you can delete the project, removing all resources associated with the project.
+Go to project selector
+
+Make sure that billing is enabled for your Cloud project. Learn how to check if billing is enabled on a project.
+
+Enable the Compute Engine API.
+Enable the API
+
+In the Cloud Console, activate Cloud Shell.
+
+Activate Cloud Shell
+
+At the bottom of the Cloud Console, a Cloud Shell session starts and displays a command-line prompt. Cloud Shell is a shell environment with the Google Cloud CLI already installed and with values already set for your current project. It can take a few seconds for the session to initialize.
+
+In this tutorial, you run all commands from Cloud Shell.
+Setting up your environment
+In Cloud Shell, make sure you are working in the Cloud project that you created or selected. Replace project-id with your Cloud project.
+
+gcloud config set project project-id
+
+export PROJECT_ID=`gcloud config list --format="value(core.project)"`
+Set the default compute region and zone.
+
+gcloud config set compute/region us-central1
+gcloud config set compute/zone us-central1-c
+export REGION=us-central1
+export ZONE=us-central1-c
+In this tutorial, the region is us-central1 and the zone is us-central1-c.
+
+Creating the VPC networks and subnets
+In Cloud Shell, create the hub VPC network and subnet:
+
+gcloud compute networks create hub-vpc --subnet-mode custom
+
+gcloud compute networks subnets create hub-subnet1 \
+    --network hub-vpc --range 10.0.0.0/24
+Create the spoke VPC networks, called spoke1-vpc and spoke2-vpc, with one subnet each:
+
+gcloud compute networks create spoke1-vpc --subnet-mode custom
+
+gcloud compute networks create spoke2-vpc --subnet-mode custom
+
+gcloud compute networks subnets create spoke1-subnet1 \
+    --network spoke1-vpc --range 192.168.1.0/24
+
+gcloud compute networks subnets create spoke2-subnet1 \
+    --network spoke2-vpc --range 192.168.2.0/24
+Create firewall rules in the hub VPC network and the spoke VPC networks. These rules allow internal traffic (TCP/80 and 443, UDP/53 and ICMP) from the specified RFC 1918 ranges:
+
+gcloud compute firewall-rules create hub-vpc-web-ping-dns \
+    --network hub-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.1.0/24,192.168.2.0/24
+
+gcloud compute firewall-rules create spoke1-vpc-web-ping-dns \
+    --network spoke1-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.1.0/24
+
+gcloud compute firewall-rules create spoke2-vpc-web-ping-dns \
+    --network spoke2-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.2.0/24
+Create firewall rules in the hub VPC network and the spoke VPC networks to allow IAP for SSH to access all your virtual machines:
+
+gcloud compute firewall-rules create hub-vpc-iap \
+    --network hub-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+
+gcloud compute firewall-rules create spoke1-vpc-iap \
+    --network spoke1-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+
+gcloud compute firewall-rules create spoke2-vpc-iap \
+    --network spoke2-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+This tutorial uses Identity-Aware Proxy (IAP) for SSH. For more information, see Connecting to instances that don't have external IP addresses.
+
+Create a firewall rule to allow health checks for autohealing instance groups in the hub VPC network:
+
+gcloud compute firewall-rules create hub-vpc-health-checks \
+    --network hub-vpc --allow tcp:443 --target-tags nat-gw \
+    --source-ranges 130.211.0.0/22,35.191.0.0/16
+Creating the instances and required routes
+In Cloud Shell, create the instance template for the NAT gateway that has a startup script that sets up the NAT gateway:
+
+gcloud compute instance-templates create \
+    hub-nat-gw-ilbnhop-template \
+    --network hub-vpc \
+    --subnet hub-subnet1 \
+    --machine-type n1-standard-2 --can-ip-forward \
+    --tags nat-gw --scopes default,compute-rw \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install dnsutils -y
+echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+eth0_ip="$(curl -H "Metadata-Flavor:Google" \
+    http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/ip)"
+google_dns1="$(dig +short dns.google | head -n 1)"
+google_dns2="$(dig +short dns.google | tail -n 1)"
+sudo iptables -t nat -A PREROUTING -p tcp -s 35.191.0.0/16 \
+    -d $eth0_ip --dport 443 -j DNAT --to $google_dns1
+sudo iptables -t nat -A PREROUTING -p tcp -s 130.211.0.0/22 \
+    -d $eth0_ip --dport 443 -j DNAT --to $google_dns2'
+The packets received from the source IP address ranges used for health checks and being sent to the NAT gateway's internal IP address are translated to Google's two Public DNS Anycast IP addresses (currently, 8.8.8.8 and 8.8.4.4).
+
+This tutorial is using n1-standard-2 as the instance type, but you can use any other number or size of gateway that you want. For example, n1-standard-2 instances are capped at 4 Gbps of network traffic per instance. If you need to handle a higher volume of traffic, you can choose n1-standard-8 instead.
+
+Create an HTTPS health-check:
+
+gcloud compute health-checks create https \
+    nat-gw-ilbnhop-health-check \
+    --check-interval 10 --unhealthy-threshold 3 --port 443 \
+    --host dns.google
+Create a regional instance group with two instances that are distributed across a single region:
+
+gcloud compute instance-groups managed create \
+    hub-nat-gw-ilbnhop-mig \
+    --region $REGION --size=2 \
+    --template=hub-nat-gw-ilbnhop-template \
+    --health-check nat-gw-ilbnhop-health-check \
+    --initial-delay 15
+In this tutorial, the initial delay is set to 15 seconds. In a production deployment, customize this setting according to your requirements. This tutorial isn't using autoscaling policies.
+
+Create a backend service and add the instance group:
+
+gcloud compute backend-services create hub-nat-gw-ilbnhop-backend \
+    --load-balancing-scheme=internal \
+    --protocol=tcp \
+    --health-checks=nat-gw-ilbnhop-health-check
+
+gcloud compute backend-services add-backend \
+    hub-nat-gw-ilbnhop-backend \
+    --instance-group=hub-nat-gw-ilbnhop-mig \
+    --instance-group-region=us-central1
+Create a forwarding rule:
+
+gcloud compute forwarding-rules create \
+    hub-nat-gw-ilbnhop \
+    --load-balancing-scheme=internal \
+    --network=hub-vpc \
+    --subnet=hub-subnet1 \
+    --address=10.0.0.10 \
+    --ip-protocol=TCP \
+    --ports=all \
+    --backend-service=hub-nat-gw-ilbnhop-backend \
+    --backend-service-region=us-central1 \
+    --service-label=hub-nat-gw-ilbnhop
+Even though the forwarding rule is defined only with TCP, when you use the internal TCP/UDP load balancer as the next hop, both TCP and UDP are supported behind the same virtual IP address. The internal TCP/UDP load Balancer is a regional load balancer.
+
+Create a new route with the forwarding rule as the next hop:
+
+gcloud compute routes create hub-nat-gw-ilbnhop \
+    --network=hub-vpc \
+    --destination-range=0.0.0.0/0 \
+    --next-hop-ilb=hub-nat-gw-ilbnhop \
+    --next-hop-ilb-region=us-central1 \
+    --priority=800
+The load balancer as the next hop cannot be tagged.
+
+Delete the default route from the hub VPC:
+
+export hub_default_route=$(gcloud compute routes list \
+    --format="value(name)" --filter="network:hub-vpc AND \
+    nextHopGateway:default-internet-gateway" | head -n 1)
+gcloud compute routes delete $hub_default_route -q
+Create a new tagged route to allow traffic only from the NAT gateways:
+
+gcloud compute routes create hub-default-tagged \
+    --network hub-vpc --destination-range 0.0.0.0/0 \
+    --next-hop-gateway default-internet-gateway \
+    --priority 700 --tags nat-gw
+Delete the default routes to the internet from VPC of each spoke:
+
+export spoke1_default_route=$(gcloud compute routes list \
+    --format="value(name)" --filter="network:spoke1-vpc AND \
+    nextHopGateway:default-internet-gateway")
+
+gcloud compute routes delete $spoke1_default_route -q
+
+export spoke2_default_route=$(gcloud compute routes list \
+    --format="value(name)" \
+    --filter="network:spoke2-vpc AND nextHopGateway:default-internet-gateway")
+
+gcloud compute routes delete $spoke2_default_route -q
+When there is a conflict between local and imported routes, the local ones always take precedence. For more information, see Routing order.
+
+To be able to later test connectivity by running traffic through the NAT gateway, create client VMs with hping3 installed through a startup script:
+
+gcloud compute instances create spoke1-client \
+    --subnet=spoke1-subnet1 --no-address \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install hping3 dnsutils -y'
+
+gcloud compute instances create spoke2-client \
+    --subnet=spoke2-subnet1 --no-address \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install hping3 dnsutils -y'
+Creating the VPC network peering connections
+VPC network peering is bidirectional, and thus it must be defined on both ends. A VPC network can peer with multiple VPC networks, but limits apply. To reach the default route over VPC network peering, you use the feature importing and exporting custom routes over VPC network peering.
+
+For this tutorial, you create all of the VPC networks in the same Cloud project.
+
+In Cloud Shell, create the VPC network peering connections from the hub VPC network to the spoke VPC networks with the route export flag enabled:
+
+gcloud compute networks peerings create hub-to-spoke1 \
+    --network hub-vpc --peer-network spoke1-vpc \
+    --peer-project $PROJECT_ID \
+    --export-custom-routes
+
+gcloud compute networks peerings create hub-to-spoke2 \
+    --network hub-vpc --peer-network spoke2-vpc \
+    --peer-project $PROJECT_ID \
+    --export-custom-routes
+Create a VPC network peering connection from the spoke1 VPC network to the hub VPC network with the route import flag enabled:
+
+gcloud compute networks peerings create spoke1-to-hub \
+    --network spoke1-vpc --peer-network hub-vpc \
+    --peer-project $PROJECT_ID \
+    --import-custom-routes
+Create a VPC network peering connection from the spoke2 VPC network to the hub VPC network with the route import flag enabled:
+
+gcloud compute networks peerings create spoke2-to-hub \
+    --network spoke2-vpc --peer-network hub-vpc \
+    --peer-project $PROJECT_ID \
+    --import-custom-routes
+Verifying route propagation and connectivity
+In Cloud Shell, verify that the static routes were correctly created as part of the startup scripts.
+
+gcloud compute routes list --filter="network:hub-vpc"
+Make sure that the hub-default-tagged and hub-nat-gw-ilbanhop routes are present in the output:
+
+NAME                            NETWORK  DEST_RANGE      NEXT_HOP                  PRIORITY
+default-route-13a4b635b5eab48c  hub-vpc  10.0.0.0/24     hub-vpc                   1000
+hub-default-tagged              hub-vpc  0.0.0.0/0       default-internet-gateway  700
+hub-nat-gw-ilbanhop             hub-vpc  0.0.0.0/0       10.0.0.10                 800
+peering-route-3274f1257a9842a0  hub-vpc  192.168.2.0/24  hub-to-spoke2             1000
+peering-route-798c5777f13094bc  hub-vpc  192.168.1.0/24  hub-to-spoke1             1000
+Verify the spoke1-vpc routing table to make sure the default route was correctly imported:
+
+gcloud compute routes list --filter="network:spoke1-vpc"
+Make sure that there is a route starting with peering-route with 0.0.0.0/0 as the DEST_RANGE value in the output:
+
+NAME                            NETWORK     DEST_RANGE      NEXT_HOP       PRIORITY
+default-route-75f6ea8f5fc54813  spoke1-vpc  192.168.1.0/24  spoke1-vpc     1000
+peering-route-6c7f130b860bfd39  spoke1-vpc  10.0.0.0/24     spoke1-to-hub  1000
+peering-route-9d44d362f98afbd8  spoke1-vpc  0.0.0.0/0       spoke1-to-hub  800
+Connect to one of the clients using SSH through IAP:
+
+gcloud compute ssh spoke1-client --tunnel-through-iap
+Verify connectivity by testing the Google public DNS through the NAT gateway:
+
+sudo hping3 -S -p 80 -c 3 dns.google
+Because the internal load balancer supports TCP and UDP, you can't verify internet connectivity by using an ICMP-based ping, so you have to use a tool such as hping3.
+
+The output is similar to the following:
+
+HPING dns.google (eth0 8.8.4.4): S set, 40 headers + 0 data bytes
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=0 win=65535 rtt=4.6 ms
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=1 win=65535 rtt=4.4 ms
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=2 win=65535 rtt=4.3 ms
+
+--- dns.google hping statistic ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max = 4.3/4.4/4.6 ms
+Verify the public IP address you use to communicate with the internet:
+
+curl ifconfig.co
+The output displays a public IP address of one of the NAT gateway instances. If you run the command again, the output might display a different public IP address because the connections are distributed by using the configured internal load-balancing session affinity (by default, client IP, protocol, and port).
+
+VPC network peering is non-transitive, so there is no connectivity between the spoke VPC networks through VPC network peering.
+
+Considerations for a production environment
+The configuration that you create in this tutorial provides two NAT gateways in a single region, each capable of 2 Gbps. ECMP load balancing isn't perfect, though, and an individual flow isn't spread across multiple links, which is what you want when using stateful devices such as next-generation firewalls.
+
+To deploy this configuration in the production environment, consider the following points:
+
+This configuration is best for ephemeral or non-stateful outbound links. If the size of the NAT gateway pool changes, TCP connections might be rebalanced, which could result in an established connection being reset.
+The nodes aren't automatically updated, so if a default Debian installation has a security vulnerability, you need to update the image manually.
+If you have VMs in multiple regions, you need to set up NAT gateways in each region.
+The bandwidth per gateway is up to 2 Gbps per core unidirectional. During a gateway failure, traffic is distributed to the remaining gateways. Because running flows aren't reprogrammed, traffic doesn't immediately resettle when the gateway comes back online. So make sure you allow enough overhead when sizing.
+To be alerted of unexpected results, use Cloud Monitoring to monitor the managed instance groups and network traffic.
+Clean up
+The easiest way to eliminate billing is to delete the Cloud project you created for the tutorial. Alternatively, you can delete the individual resources.
+Delete the project
+Caution: Deleting a project has the following effects:
+Everything in the project is deleted. If you used an existing project for this tutorial, when you delete it, you also delete any other work you've done in the project.
+Custom project IDs are lost. When you created this project, you might have created a custom project ID that you want to use in the future. To preserve the URLs that use the project ID, such as an appspot.com URL, delete selected resources inside the project instead of deleting the whole project.
+In the Cloud Console, go to the Manage resources page.
+Go to Manage resources
+
+In the project list, select the project that you want to delete, and then click Delete.
+In the dialog, type the project ID, and then click Shut down to delete the project.
+Delete the individual resources
+If you want to keep the Cloud project, you can delete the resources that you created for this tutorial.
+
+Delete the VPC peerings:
+
+gcloud compute networks peerings delete spoke2-to-hub \
+    --network spoke2-vpc -q
+
+gcloud compute networks peerings delete spoke1-to-hub \
+    --network spoke1-vpc -q
+
+gcloud compute networks peerings delete hub-to-spoke1 \
+    --network hub-vpc -q
+
+gcloud compute networks peerings delete hub-to-spoke2 \
+    --network hub-vpc -q
+Delete the instances, templates, and routes:
+
+gcloud compute instances delete spoke1-client \
+    --zone=us-central1-c -q
+
+gcloud compute instances delete spoke2-client \
+    --zone=us-central1-c -q
+
+gcloud compute instance-groups managed delete hub-nat-gw-mig \
+    --region us-central1 -q
+
+gcloud compute health-checks delete nat-gw-health-check -q
+
+gcloud compute instance-templates delete hub-nat-gw-template -q
+
+gcloud compute routes delete hub-default-tagged -q
+Delete the firewall rules, subnets, and VPCs:
+
+gcloud compute firewall-rules delete spoke2-vpc-iap -q
+
+gcloud compute firewall-rules delete spoke2-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete spoke1-vpc-iap -q
+
+gcloud compute firewall-rules delete spoke1-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete hub-vpc-iap -q
+
+gcloud compute firewall-rules delete hub-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete hub-vpc-health-checks -q
+
+gcloud compute networks subnets delete spoke1-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks subnets delete spoke2-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks subnets delete hub-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks delete spoke1-vpc -q
+
+gcloud compute networks delete spoke2-vpc -q
+
+gcloud compute networks delete hub-vpc -q
+What's next
+Read about Best practices and reference architectures for VPC design.
+Review the VPC peering documentation and Next-hop concepts for internal TCP/UDP load balancing.
+Read about Special configurations for VM instances, including the Building high availability and high-bandwidth NAT gateways section.
+Explore reference architectures, diagrams, tutorials, and best practices about Google Cloud. Take a look at our Cloud Architecture Center.
+Was this helpful?
+
+Send feedback
+Except as otherwise noted, the content of this page is licensed under the Creative Commons Attribution 4.0 License, and code samples are licensed under the Apache 2.0 License. For details, see the Google Developers Site Policies. Java is a registered trademark of Oracle and/or its affiliates.
+
+Last updated 2022-03-31 UTC.
+
+Why Google
+Choosing Google Cloud
+Trust and security
+Open cloud
+Multicloud
+Global infrastructure
+Sustainability
+Customers and case studies
+Analyst reports
+Whitepapers
+Blog
+Products and pricing
+Google Cloud pricing
+Google Workspace pricing
+Maps Platform pricing
+See all products
+Solutions
+Infrastructure modernization
+Databases
+Application modernization
+Smart analytics
+Artificial Intelligence
+Security
+Productivity & work transformation
+Industry solutions
+DevOps solutions
+Small business solutions
+See all solutions
+Resources
+Google Cloud documentation
+Google Cloud quickstarts
+Google Cloud Marketplace
+Google Workspace Marketplace
+Learn about cloud computing
+Support
+Code samples
+Tutorials
+Training
+Certifications
+Google Developers
+Google Cloud for Startups
+System status
+Release Notes
+Engage
+Contact sales
+Find a Partner
+Become a Partner
+Events
+Podcast
+Developer Center
+Press Corner
+Google Cloud on YouTube
+Google Cloud Tech on YouTube
+Google Workspace on YouTube
+Follow on Twitter
+Join User Research
+We're hiring. Join Google Cloud!
+Google Cloud Community
+About Google
+Privacy
+Site terms
+Google Cloud terms
+Carbon neutral since 2007
+Sign up for the Google Cloud newsletter
+Subscribe
+
+English
+The new page has loaded.
+Google Cloud
+Why Google
+Solutions
+Products
+Pricing
+Getting Started
+
+Docs
+Support
+
+English
+Console
+
+Cloud Architecture Center
+Contact Us
+Get started for free
+Filter
+
+Cloud Architecture Center
+Was this helpful?
+
+Send feedbackDeploying centralized VM-based appliances using internal TCP/UDP load balancer as the next hop
+This tutorial describes how to use Virtual Private Cloud (VPC) network peering to deploy a hub-and-spoke architecture.
+
+This tutorial is for cloud network engineers and operations professionals who want to implement a hub-and-spoke architecture in their Google Cloud environment using centralized appliances consisting of Compute Engine virtual machines. In this tutorial, you deploy these virtual machines as NAT gateways, but you can use the same approach for other functions such as next-generation firewalls. This tutorial assumes you are familiar with VPC networks and Compute Engine.
+
+Architecture
+In this architecture, a set of spoke VPC networks communicate with the outside through a hub VPC network in which traffic is routed through a centralized pool of appliances, in this case network address translation (NAT) gateways. The relevant routes are exported from the hub VPC network into the spoke VPC networks. The NAT gateways are configured as backends of an internal load balancer with a new default route, which has internal TCP/UDP load balancer from Cloud Load Balancing as the next hop.
+
+You can achieve the same type of load distribution and high availability by using multiple routes with equal cost multi-path (ECMP) routing. However, using the internal load balancer has the following advantages:
+
+Traffic is only forwarded to healthy instances when you rely on health checks. With ECMP, traffic is forwarded to all active instances that the route points to; using internal TCP/UDP load balancing eliminates the possibility of unused routes. Also, there is no need to clean up routes when instances are terminated or restarted.
+There is a potentially faster failover because you can fine-tune the health-check timers. If you use managed instance groups and autohealing, you can still customize the health-check timers, but they're used to recreate the instance, not route traffic.
+Google also offers Cloud NAT as a managed service, providing high availability without user management and intervention. However, Cloud NAT isn't supported in this use case because the NAT configuration isn't imported into a peered network.
+
+The following diagram shows the topology that you build in this tutorial.
+
+Architecture of a hub VPC network with two spoke VPC networks.
+
+The topology consists of a hub VPC network and two spoke VPC networks that are peered with the hub VPC network by using VPC network peering. The hub VPC network has two NAT gateway instances behind an internal TCP/UDP load balancer. A static default route (0/0 NAT-GW-ILB) points to the internal TCP/UDP load balancer as the next hop. This static default route is exported over the VPC network peering using custom routes.
+
+Objectives
+Create multiple VPC networks and peer them by using a hub-and-spoke architecture.
+Create and configure NAT gateways in the hub VPC network.
+Set up and configure the internal TCP/UDP load balancer as the next hop.
+Verify connectivity from the spoke VPC networks to the public internet.
+Costs
+This tutorial uses the following billable components of Google Cloud:
+
+Compute Engine
+To generate a cost estimate based on your projected usage, use the pricing calculator. New Google Cloud users might be eligible for a free trial.
+When you finish this tutorial, you can avoid continued billing by deleting the resources you created. For more information, see Clean up.
+
+Before you begin
+If you're new to Google Cloud, create an account to evaluate how our products perform in real-world scenarios. New customers also get $300 in free credits to run, test, and deploy workloads.
+In the Google Cloud Console, on the project selector page, select or create a Google Cloud project.
+
+Note: If you don't plan to keep the resources that you create in this procedure, create a project instead of selecting an existing project. After you finish these steps, you can delete the project, removing all resources associated with the project.
+Go to project selector
+
+Make sure that billing is enabled for your Cloud project. Learn how to check if billing is enabled on a project.
+
+Enable the Compute Engine API.
+Enable the API
+
+In the Cloud Console, activate Cloud Shell.
+
+Activate Cloud Shell
+
+At the bottom of the Cloud Console, a Cloud Shell session starts and displays a command-line prompt. Cloud Shell is a shell environment with the Google Cloud CLI already installed and with values already set for your current project. It can take a few seconds for the session to initialize.
+
+In this tutorial, you run all commands from Cloud Shell.
+Setting up your environment
+In Cloud Shell, make sure you are working in the Cloud project that you created or selected. Replace project-id with your Cloud project.
+
+gcloud config set project project-id
+
+export PROJECT_ID=`gcloud config list --format="value(core.project)"`
+Set the default compute region and zone.
+
+gcloud config set compute/region us-central1
+gcloud config set compute/zone us-central1-c
+export REGION=us-central1
+export ZONE=us-central1-c
+In this tutorial, the region is us-central1 and the zone is us-central1-c.
+
+Creating the VPC networks and subnets
+In Cloud Shell, create the hub VPC network and subnet:
+
+gcloud compute networks create hub-vpc --subnet-mode custom
+
+gcloud compute networks subnets create hub-subnet1 \
+    --network hub-vpc --range 10.0.0.0/24
+Create the spoke VPC networks, called spoke1-vpc and spoke2-vpc, with one subnet each:
+
+gcloud compute networks create spoke1-vpc --subnet-mode custom
+
+gcloud compute networks create spoke2-vpc --subnet-mode custom
+
+gcloud compute networks subnets create spoke1-subnet1 \
+    --network spoke1-vpc --range 192.168.1.0/24
+
+gcloud compute networks subnets create spoke2-subnet1 \
+    --network spoke2-vpc --range 192.168.2.0/24
+Create firewall rules in the hub VPC network and the spoke VPC networks. These rules allow internal traffic (TCP/80 and 443, UDP/53 and ICMP) from the specified RFC 1918 ranges:
+
+gcloud compute firewall-rules create hub-vpc-web-ping-dns \
+    --network hub-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.1.0/24,192.168.2.0/24
+
+gcloud compute firewall-rules create spoke1-vpc-web-ping-dns \
+    --network spoke1-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.1.0/24
+
+gcloud compute firewall-rules create spoke2-vpc-web-ping-dns \
+    --network spoke2-vpc --allow tcp:80,tcp:443,icmp,udp:53 \
+    --source-ranges 10.0.0.0/24,192.168.2.0/24
+Create firewall rules in the hub VPC network and the spoke VPC networks to allow IAP for SSH to access all your virtual machines:
+
+gcloud compute firewall-rules create hub-vpc-iap \
+    --network hub-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+
+gcloud compute firewall-rules create spoke1-vpc-iap \
+    --network spoke1-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+
+gcloud compute firewall-rules create spoke2-vpc-iap \
+    --network spoke2-vpc --allow tcp:22 \
+    --source-ranges 35.235.240.0/20
+This tutorial uses Identity-Aware Proxy (IAP) for SSH. For more information, see Connecting to instances that don't have external IP addresses.
+
+Create a firewall rule to allow health checks for autohealing instance groups in the hub VPC network:
+
+gcloud compute firewall-rules create hub-vpc-health-checks \
+    --network hub-vpc --allow tcp:443 --target-tags nat-gw \
+    --source-ranges 130.211.0.0/22,35.191.0.0/16
+Creating the instances and required routes
+In Cloud Shell, create the instance template for the NAT gateway that has a startup script that sets up the NAT gateway:
+
+gcloud compute instance-templates create \
+    hub-nat-gw-ilbnhop-template \
+    --network hub-vpc \
+    --subnet hub-subnet1 \
+    --machine-type n1-standard-2 --can-ip-forward \
+    --tags nat-gw --scopes default,compute-rw \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install dnsutils -y
+echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+eth0_ip="$(curl -H "Metadata-Flavor:Google" \
+    http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/ip)"
+google_dns1="$(dig +short dns.google | head -n 1)"
+google_dns2="$(dig +short dns.google | tail -n 1)"
+sudo iptables -t nat -A PREROUTING -p tcp -s 35.191.0.0/16 \
+    -d $eth0_ip --dport 443 -j DNAT --to $google_dns1
+sudo iptables -t nat -A PREROUTING -p tcp -s 130.211.0.0/22 \
+    -d $eth0_ip --dport 443 -j DNAT --to $google_dns2'
+The packets received from the source IP address ranges used for health checks and being sent to the NAT gateway's internal IP address are translated to Google's two Public DNS Anycast IP addresses (currently, 8.8.8.8 and 8.8.4.4).
+
+This tutorial is using n1-standard-2 as the instance type, but you can use any other number or size of gateway that you want. For example, n1-standard-2 instances are capped at 4 Gbps of network traffic per instance. If you need to handle a higher volume of traffic, you can choose n1-standard-8 instead.
+
+Create an HTTPS health-check:
+
+gcloud compute health-checks create https \
+    nat-gw-ilbnhop-health-check \
+    --check-interval 10 --unhealthy-threshold 3 --port 443 \
+    --host dns.google
+Create a regional instance group with two instances that are distributed across a single region:
+
+gcloud compute instance-groups managed create \
+    hub-nat-gw-ilbnhop-mig \
+    --region $REGION --size=2 \
+    --template=hub-nat-gw-ilbnhop-template \
+    --health-check nat-gw-ilbnhop-health-check \
+    --initial-delay 15
+In this tutorial, the initial delay is set to 15 seconds. In a production deployment, customize this setting according to your requirements. This tutorial isn't using autoscaling policies.
+
+Create a backend service and add the instance group:
+
+gcloud compute backend-services create hub-nat-gw-ilbnhop-backend \
+    --load-balancing-scheme=internal \
+    --protocol=tcp \
+    --health-checks=nat-gw-ilbnhop-health-check
+
+gcloud compute backend-services add-backend \
+    hub-nat-gw-ilbnhop-backend \
+    --instance-group=hub-nat-gw-ilbnhop-mig \
+    --instance-group-region=us-central1
+Create a forwarding rule:
+
+gcloud compute forwarding-rules create \
+    hub-nat-gw-ilbnhop \
+    --load-balancing-scheme=internal \
+    --network=hub-vpc \
+    --subnet=hub-subnet1 \
+    --address=10.0.0.10 \
+    --ip-protocol=TCP \
+    --ports=all \
+    --backend-service=hub-nat-gw-ilbnhop-backend \
+    --backend-service-region=us-central1 \
+    --service-label=hub-nat-gw-ilbnhop
+Even though the forwarding rule is defined only with TCP, when you use the internal TCP/UDP load balancer as the next hop, both TCP and UDP are supported behind the same virtual IP address. The internal TCP/UDP load Balancer is a regional load balancer.
+
+Create a new route with the forwarding rule as the next hop:
+
+gcloud compute routes create hub-nat-gw-ilbnhop \
+    --network=hub-vpc \
+    --destination-range=0.0.0.0/0 \
+    --next-hop-ilb=hub-nat-gw-ilbnhop \
+    --next-hop-ilb-region=us-central1 \
+    --priority=800
+The load balancer as the next hop cannot be tagged.
+
+Delete the default route from the hub VPC:
+
+export hub_default_route=$(gcloud compute routes list \
+    --format="value(name)" --filter="network:hub-vpc AND \
+    nextHopGateway:default-internet-gateway" | head -n 1)
+gcloud compute routes delete $hub_default_route -q
+Create a new tagged route to allow traffic only from the NAT gateways:
+
+gcloud compute routes create hub-default-tagged \
+    --network hub-vpc --destination-range 0.0.0.0/0 \
+    --next-hop-gateway default-internet-gateway \
+    --priority 700 --tags nat-gw
+Delete the default routes to the internet from VPC of each spoke:
+
+export spoke1_default_route=$(gcloud compute routes list \
+    --format="value(name)" --filter="network:spoke1-vpc AND \
+    nextHopGateway:default-internet-gateway")
+
+gcloud compute routes delete $spoke1_default_route -q
+
+export spoke2_default_route=$(gcloud compute routes list \
+    --format="value(name)" \
+    --filter="network:spoke2-vpc AND nextHopGateway:default-internet-gateway")
+
+gcloud compute routes delete $spoke2_default_route -q
+When there is a conflict between local and imported routes, the local ones always take precedence. For more information, see Routing order.
+
+To be able to later test connectivity by running traffic through the NAT gateway, create client VMs with hping3 installed through a startup script:
+
+gcloud compute instances create spoke1-client \
+    --subnet=spoke1-subnet1 --no-address \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install hping3 dnsutils -y'
+
+gcloud compute instances create spoke2-client \
+    --subnet=spoke2-subnet1 --no-address \
+    --metadata startup-script='#! /bin/bash
+apt-get update
+apt-get install hping3 dnsutils -y'
+Creating the VPC network peering connections
+VPC network peering is bidirectional, and thus it must be defined on both ends. A VPC network can peer with multiple VPC networks, but limits apply. To reach the default route over VPC network peering, you use the feature importing and exporting custom routes over VPC network peering.
+
+For this tutorial, you create all of the VPC networks in the same Cloud project.
+
+In Cloud Shell, create the VPC network peering connections from the hub VPC network to the spoke VPC networks with the route export flag enabled:
+
+gcloud compute networks peerings create hub-to-spoke1 \
+    --network hub-vpc --peer-network spoke1-vpc \
+    --peer-project $PROJECT_ID \
+    --export-custom-routes
+
+gcloud compute networks peerings create hub-to-spoke2 \
+    --network hub-vpc --peer-network spoke2-vpc \
+    --peer-project $PROJECT_ID \
+    --export-custom-routes
+Create a VPC network peering connection from the spoke1 VPC network to the hub VPC network with the route import flag enabled:
+
+gcloud compute networks peerings create spoke1-to-hub \
+    --network spoke1-vpc --peer-network hub-vpc \
+    --peer-project $PROJECT_ID \
+    --import-custom-routes
+Create a VPC network peering connection from the spoke2 VPC network to the hub VPC network with the route import flag enabled:
+
+gcloud compute networks peerings create spoke2-to-hub \
+    --network spoke2-vpc --peer-network hub-vpc \
+    --peer-project $PROJECT_ID \
+    --import-custom-routes
+Verifying route propagation and connectivity
+In Cloud Shell, verify that the static routes were correctly created as part of the startup scripts.
+
+gcloud compute routes list --filter="network:hub-vpc"
+Make sure that the hub-default-tagged and hub-nat-gw-ilbanhop routes are present in the output:
+
+NAME                            NETWORK  DEST_RANGE      NEXT_HOP                  PRIORITY
+default-route-13a4b635b5eab48c  hub-vpc  10.0.0.0/24     hub-vpc                   1000
+hub-default-tagged              hub-vpc  0.0.0.0/0       default-internet-gateway  700
+hub-nat-gw-ilbanhop             hub-vpc  0.0.0.0/0       10.0.0.10                 800
+peering-route-3274f1257a9842a0  hub-vpc  192.168.2.0/24  hub-to-spoke2             1000
+peering-route-798c5777f13094bc  hub-vpc  192.168.1.0/24  hub-to-spoke1             1000
+Verify the spoke1-vpc routing table to make sure the default route was correctly imported:
+
+gcloud compute routes list --filter="network:spoke1-vpc"
+Make sure that there is a route starting with peering-route with 0.0.0.0/0 as the DEST_RANGE value in the output:
+
+NAME                            NETWORK     DEST_RANGE      NEXT_HOP       PRIORITY
+default-route-75f6ea8f5fc54813  spoke1-vpc  192.168.1.0/24  spoke1-vpc     1000
+peering-route-6c7f130b860bfd39  spoke1-vpc  10.0.0.0/24     spoke1-to-hub  1000
+peering-route-9d44d362f98afbd8  spoke1-vpc  0.0.0.0/0       spoke1-to-hub  800
+Connect to one of the clients using SSH through IAP:
+
+gcloud compute ssh spoke1-client --tunnel-through-iap
+Verify connectivity by testing the Google public DNS through the NAT gateway:
+
+sudo hping3 -S -p 80 -c 3 dns.google
+Because the internal load balancer supports TCP and UDP, you can't verify internet connectivity by using an ICMP-based ping, so you have to use a tool such as hping3.
+
+The output is similar to the following:
+
+HPING dns.google (eth0 8.8.4.4): S set, 40 headers + 0 data bytes
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=0 win=65535 rtt=4.6 ms
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=1 win=65535 rtt=4.4 ms
+len=44 ip=8.8.4.4 ttl=126 DF id=0 sport=80 flags=SA seq=2 win=65535 rtt=4.3 ms
+
+--- dns.google hping statistic ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max = 4.3/4.4/4.6 ms
+Verify the public IP address you use to communicate with the internet:
+
+curl ifconfig.co
+The output displays a public IP address of one of the NAT gateway instances. If you run the command again, the output might display a different public IP address because the connections are distributed by using the configured internal load-balancing session affinity (by default, client IP, protocol, and port).
+
+VPC network peering is non-transitive, so there is no connectivity between the spoke VPC networks through VPC network peering.
+
+Considerations for a production environment
+The configuration that you create in this tutorial provides two NAT gateways in a single region, each capable of 2 Gbps. ECMP load balancing isn't perfect, though, and an individual flow isn't spread across multiple links, which is what you want when using stateful devices such as next-generation firewalls.
+
+To deploy this configuration in the production environment, consider the following points:
+
+This configuration is best for ephemeral or non-stateful outbound links. If the size of the NAT gateway pool changes, TCP connections might be rebalanced, which could result in an established connection being reset.
+The nodes aren't automatically updated, so if a default Debian installation has a security vulnerability, you need to update the image manually.
+If you have VMs in multiple regions, you need to set up NAT gateways in each region.
+The bandwidth per gateway is up to 2 Gbps per core unidirectional. During a gateway failure, traffic is distributed to the remaining gateways. Because running flows aren't reprogrammed, traffic doesn't immediately resettle when the gateway comes back online. So make sure you allow enough overhead when sizing.
+To be alerted of unexpected results, use Cloud Monitoring to monitor the managed instance groups and network traffic.
+Clean up
+The easiest way to eliminate billing is to delete the Cloud project you created for the tutorial. Alternatively, you can delete the individual resources.
+Delete the project
+Caution: Deleting a project has the following effects:
+Everything in the project is deleted. If you used an existing project for this tutorial, when you delete it, you also delete any other work you've done in the project.
+Custom project IDs are lost. When you created this project, you might have created a custom project ID that you want to use in the future. To preserve the URLs that use the project ID, such as an appspot.com URL, delete selected resources inside the project instead of deleting the whole project.
+In the Cloud Console, go to the Manage resources page.
+Go to Manage resources
+
+In the project list, select the project that you want to delete, and then click Delete.
+In the dialog, type the project ID, and then click Shut down to delete the project.
+Delete the individual resources
+If you want to keep the Cloud project, you can delete the resources that you created for this tutorial.
+
+Delete the VPC peerings:
+
+gcloud compute networks peerings delete spoke2-to-hub \
+    --network spoke2-vpc -q
+
+gcloud compute networks peerings delete spoke1-to-hub \
+    --network spoke1-vpc -q
+
+gcloud compute networks peerings delete hub-to-spoke1 \
+    --network hub-vpc -q
+
+gcloud compute networks peerings delete hub-to-spoke2 \
+    --network hub-vpc -q
+Delete the instances, templates, and routes:
+
+gcloud compute instances delete spoke1-client \
+    --zone=us-central1-c -q
+
+gcloud compute instances delete spoke2-client \
+    --zone=us-central1-c -q
+
+gcloud compute instance-groups managed delete hub-nat-gw-mig \
+    --region us-central1 -q
+
+gcloud compute health-checks delete nat-gw-health-check -q
+
+gcloud compute instance-templates delete hub-nat-gw-template -q
+
+gcloud compute routes delete hub-default-tagged -q
+Delete the firewall rules, subnets, and VPCs:
+
+gcloud compute firewall-rules delete spoke2-vpc-iap -q
+
+gcloud compute firewall-rules delete spoke2-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete spoke1-vpc-iap -q
+
+gcloud compute firewall-rules delete spoke1-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete hub-vpc-iap -q
+
+gcloud compute firewall-rules delete hub-vpc-web-ping-dns -q
+
+gcloud compute firewall-rules delete hub-vpc-health-checks -q
+
+gcloud compute networks subnets delete spoke1-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks subnets delete spoke2-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks subnets delete hub-subnet1 \
+    --region us-central1 -q
+
+gcloud compute networks delete spoke1-vpc -q
+
+gcloud compute networks delete spoke2-vpc -q
+
+gcloud compute networks delete hub-vpc -q
+What's next
+Read about Best practices and reference architectures for VPC design.
+Review the VPC peering documentation and Next-hop concepts for internal TCP/UDP load balancing.
+Read about Special configurations for VM instances, including the Building high availability and high-bandwidth NAT gateways section.
+Explore reference architectures, diagrams, tutorials, and best practices about Google Cloud. Take a look at our Cloud Architecture Center.
+Was this helpful?
+
+Send feedback
+Except as otherwise noted, the content of this page is licensed under the Creative Commons Attribution 4.0 License, and code samples are licensed under the Apache 2.0 License. For details, see the Google Developers Site Policies. Java is a registered trademark of Oracle and/or its affiliates.
+
+Last updated 2022-03-31 UTC.
+
+Why Google
+Choosing Google Cloud
+Trust and security
+Open cloud
+Multicloud
+Global infrastructure
+Sustainability
+Customers and case studies
+Analyst reports
+Whitepapers
+Blog
+Products and pricing
+Google Cloud pricing
+Google Workspace pricing
+Maps Platform pricing
+See all products
+Solutions
+Infrastructure modernization
+Databases
+Application modernization
+Smart analytics
+Artificial Intelligence
+Security
+Productivity & work transformation
+Industry solutions
+DevOps solutions
+Small business solutions
+See all solutions
+Resources
+Google Cloud documentation
+Google Cloud quickstarts
+Google Cloud Marketplace
+Google Workspace Marketplace
+Learn about cloud computing
+Support
+Code samples
+Tutorials
+Training
+Certifications
+Google Developers
+Google Cloud for Startups
+System status
+Release Notes
+Engage
+Contact sales
+Find a Partner
+Become a Partner
+Events
+Podcast
+Developer Center
+Press Corner
+Google Cloud on YouTube
+Google Cloud Tech on YouTube
+Google Workspace on YouTube
+Follow on Twitter
+Join User Research
+We're hiring. Join Google Cloud!
+Google Cloud Community
+About Google
+Privacy
+Site terms
+Google Cloud terms
+Carbon neutral since 2007
+Sign up for the Google Cloud newsletter
+Subscribe
+
+English
+The new page has loaded.
