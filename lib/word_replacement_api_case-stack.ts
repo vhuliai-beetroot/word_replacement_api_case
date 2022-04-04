@@ -49,7 +49,7 @@ export class WordReplacementApiCaseStack extends Stack {
       memoryLimitMiB: 512,
       cpu: 256,
       environment: {
-        WR_JWK4JWT: appJWK4JWT,
+        WR_JWK4JWT: appJWK4JWT
       },
       logging
     });

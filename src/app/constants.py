@@ -1,4 +1,3 @@
-
 REPLACEMENT_MAP = {
     "Oracle": "Oracle©",
     "Google": "Google©",
